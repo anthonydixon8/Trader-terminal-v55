@@ -1,296 +1,394 @@
-<!DOCTYPE html>
-<pre><code>import streamlit as st
+import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import numpy as np
 from datetime import datetime
-import json, os, time
-from ib_insync import IB, Stock, MarketOrder, StopOrder, LimitOrder, Option
+import time
 
-st.set_page_config(
-    page_title="Day Trader Terminal v5.5",
-    layout="wide",
-    page_icon="📈",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="TRADER TERMINAL v6.1", layout="wide", page_icon="📈")
 
-st.title("📈 Day Trader Terminal v5.5 • IBKR Integration")
-st.markdown("**✅ Analyze ANY stock or commodity instantly** — no watchlist required")
+st.markdown("""<style>
+.stApp{background-color:#04080d!important}
+section[data-testid="stSidebar"]{background-color:#070e17!important;border-right:1px solid #0d2035}
+.stTabs [data-baseweb="tab-list"]{background-color:#070e17;gap:0}
+.stTabs [data-baseweb="tab"]{color:#4a7a9a;font-family:'Courier New',monospace;font-size:.72rem;font-weight:700;letter-spacing:.1em;padding:10px 16px}
+.stTabs [aria-selected="true"]{color:#00d4ff!important;border-bottom:2px solid #00d4ff!important}
+[data-testid="stMetricLabel"]{color:#4a7a9a!important;font-size:.65rem!important;text-transform:uppercase;letter-spacing:.1em}
+[data-testid="stMetricValue"]{color:white!important;font-family:'Courier New',monospace;font-weight:700}
+.stTextInput>div>div>input{background-color:#0b1520!important;border:1px solid #0d2035!important;color:#00d4ff!important;font-family:'Courier New',monospace!important;font-weight:700!important;text-transform:uppercase}
+.stButton>button{background:transparent!important;border:1px solid #00d4ff!important;color:#00d4ff!important;font-family:'Courier New',monospace!important;font-weight:700!important;letter-spacing:.1em!important;text-transform:uppercase!important;border-radius:0!important}
+.stButton>button:hover{background:#00d4ff!important;color:#04080d!important}
+footer{visibility:hidden}#MainMenu{visibility:hidden}
+</style>""", unsafe_allow_html=True)
 
-# ==================== MOBILE / iPAD FRIENDLY STYLES ====================
-st.markdown("""
-<style>
-    .stApp { max-width: 100%; }
-    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    .stTextInput > div > div > input { font-size: 1.1rem; }
-    .stSelectbox { font-size: 1.1rem; }
-    @media (max-width: 768px) {
-        .stApp { padding: 0.5rem; }
+
+@st.cache_data(ttl=30)
+def get_data(sym, interval="15m", period="5d"):
+    try:
+        df = yf.download(sym, interval=interval, period=period, progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df if not df.empty and len(df) >= 20 else None
+    except Exception:
+        return None
+
+
+def calc_rsi(s, p=14):
+    d = s.diff()
+    g = d.clip(lower=0).ewm(com=p - 1, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(com=p - 1, adjust=False).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
+
+def calc_macd(s):
+    m = s.ewm(span=12, adjust=False).mean() - s.ewm(span=26, adjust=False).mean()
+    sig = m.ewm(span=9, adjust=False).mean()
+    return m, sig, m - sig
+
+
+def calc_bb(s, p=20, k=2):
+    m = s.rolling(p).mean()
+    std = s.rolling(p).std()
+    return m + k * std, m, m - k * std
+
+
+def calc_atr(df, p=14):
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - df["Close"].shift()).abs(),
+        (df["Low"] - df["Close"].shift()).abs()
+    ], axis=1).max(axis=1)
+    return float(tr.rolling(p).mean().iloc[-1])
+
+
+def calc_vwap(df):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    return (tp * df["Volume"]).cumsum() / df["Volume"].cumsum()
+
+
+def run_bots(df):
+    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+    rsi = calc_rsi(c)
+    ml, ms, mh = calc_macd(c)
+    bu, bm, bl = calc_bb(c)
+    vw = calc_vwap(df)
+    atr = calc_atr(df)
+
+    def safe(series, default=0):
+        val = series.iloc[-1]
+        return float(val) if not pd.isna(val) else default
+
+    px = float(c.iloc[-1])
+    rv = safe(rsi, 50)
+    mv = safe(ml)
+    msv = safe(ms)
+    s20 = float(c.rolling(20).mean().iloc[-1]) if len(c) >= 20 else px
+    s50 = float(c.rolling(50).mean().iloc[-1]) if len(c) >= 50 else px
+    vv = float(vw.iloc[-1])
+    bl_ = safe(bl, px * 0.95)
+    bu_ = safe(bu, px * 1.05)
+    pctB = (px - bl_) / (bu_ - bl_) if bu_ > bl_ else 0.5
+    avg_v = float(v.iloc[-20:].mean())
+    v_spike = float(v.iloc[-1]) > avg_v * 1.8
+    rsi_sl = rsi.dropna().iloc[-14:]
+    lo, hi = float(rsi_sl.min()), float(rsi_sl.max())
+    stk = (rv - lo) / (hi - lo) * 100 if hi > lo else 50
+
+    mom = "B" if (px > s20 and rv > 55 and mv > msv) else "R" if (px < s20 and rv < 45 and mv < msv) else "N"
+    rev = "B" if rv < 30 else "R" if rv > 70 else "N"
+    vs  = "B" if px > vv * 1.001 else "R" if px < vv * 0.999 else "N"
+    bs  = "B" if pctB < 0.15 else "R" if pctB > 0.85 else "N"
+    ss  = "B" if stk < 25 else "R" if stk > 75 else "N"
+
+    arrow_up = "\u2191"
+    arrow_dn = "\u2193"
+    bots = [
+        {"name": "Momentum",   "sig": mom, "detail": "RSI {:.1f} | MACD {} | Vol {}".format(rv, arrow_up if mv > msv else arrow_dn, "SPIKE" if v_spike else "Normal")},
+        {"name": "Reversal",   "sig": rev, "detail": "RSI {:.1f} | {}".format(rv, "Oversold" if rv < 30 else "Overbought" if rv > 70 else "Neutral")},
+        {"name": "VWAP",       "sig": vs,  "detail": "{:+.2f}% vs VWAP ${:.2f}".format((px / vv - 1) * 100, vv)},
+        {"name": "Bollinger",  "sig": bs,  "detail": "%B {:.2f} | ATR ${:.2f}".format(pctB, atr)},
+        {"name": "Stochastic", "sig": ss,  "detail": "%K {:.1f}".format(stk)},
+    ]
+    sc = sum(1 if b["sig"] == "B" else -1 if b["sig"] == "R" else 0 for b in bots)
+    overall = "CALL" if sc >= 2 else "PUT" if sc <= -2 else "NEUTRAL"
+    prev = float(c.iloc[-2]) if len(c) >= 2 else px
+    return {
+        "bots": bots, "overall": overall, "pct": abs(sc) / 5 * 100,
+        "px": px, "chg": (px - prev) / prev * 100,
+        "rv": rv, "atr": atr, "vv": vv, "s20": s20, "s50": s50,
+        "mv": mv, "msv": msv, "pctB": pctB, "stk": stk, "sc": sc,
+        "rsi": rsi, "ml": ml, "ms": ms, "mh": mh,
+        "bu": bu, "bm": bm, "bl": bl, "vw": vw,
     }
-</style>
-""", unsafe_allow_html=True)
 
-# Sidebar
-st.sidebar.header("Watchlist (Optional)")
-WATCHLIST_FILE = "watchlist.json"
 
-def load_watchlist():
-    if os.path.exists(WATCHLIST_FILE):
-        with open(WATCHLIST_FILE, "r") as f: return json.load(f)
-    return []
+def run_backtest(df, strat="momentum"):
+    c, h, l = df["Close"], df["High"], df["Low"]
+    rsi = calc_rsi(c)
+    ml, ms, _ = calc_macd(c)
+    s20 = c.rolling(20).mean()
+    pos = None
+    trades, equity, peak, wins, losses, maxDD = [], 10000.0, 10000.0, 0, 0, 0.0
+    for i in range(30, len(c)):
+        rv  = float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else None
+        mv  = float(ml.iloc[i])  if not pd.isna(ml.iloc[i])  else None
+        msv = float(ms.iloc[i])  if not pd.isna(ms.iloc[i])  else None
+        s   = float(s20.iloc[i]) if not pd.isna(s20.iloc[i]) else None
+        if None in (rv, mv, msv, s):
+            continue
+        ci = float(c.iloc[i])
+        if strat == "momentum":
+            sig = "B" if (ci > s and rv > 55 and mv > msv) else "R" if (ci < s and rv < 45 and mv < msv) else "N"
+        else:
+            sig = "B" if rv < 28 else "R" if rv > 72 else "N"
+        if pos is None and sig != "N":
+            pos = {"dir": sig, "entry": ci,
+                   "sl": ci * 0.97 if sig == "B" else ci * 1.03,
+                   "tp": ci * 1.05 if sig == "B" else ci * 0.95}
+        elif pos:
+            hi_ = float(h.iloc[i])
+            lo_ = float(l.iloc[i])
+            sl_hit = lo_ <= pos["sl"] if pos["dir"] == "B" else hi_ >= pos["sl"]
+            tp_hit = hi_ >= pos["tp"] if pos["dir"] == "B" else lo_ <= pos["tp"]
+            if sl_hit or tp_hit or i == len(c) - 1:
+                ex = pos["tp"] if tp_hit else pos["sl"]
+                pnl = (ex - pos["entry"]) / pos["entry"] if pos["dir"] == "B" else (pos["entry"] - ex) / pos["entry"]
+                equity *= (1 + pnl * 0.1)
+                peak = max(peak, equity)
+                maxDD = max(maxDD, (peak - equity) / peak)
+                if pnl > 0:
+                    wins += 1
+                else:
+                    losses += 1
+                trades.append({
+                    "dir": "LONG" if pos["dir"] == "B" else "SHORT",
+                    "entry": round(pos["entry"], 2),
+                    "exit": round(ex, 2),
+                    "pnl%": round(pnl * 100, 2),
+                    "result": "WIN" if pnl > 0 else "LOSS",
+                })
+                pos = None
+    total = wins + losses
+    return {
+        "equity": round(equity, 2), "trades": trades[-8:],
+        "wins": wins, "losses": losses,
+        "wr": round(wins / total * 100, 1) if total else 0,
+        "maxDD": round(maxDD * 100, 1), "total": total,
+    }
 
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist()
 
-new_ticker = st.sidebar.text_input("Add to Watchlist", "")
-if st.sidebar.button("➕ Add"):
-    t = new_ticker.upper().strip()
-    if t and t not in [w["ticker"] for w in st.session_state.watchlist]:
-        st.session_state.watchlist.append({"ticker": t, "added": datetime.now().strftime("%Y-%m-%d %H:%M")})
-        with open(WATCHLIST_FILE, "w") as f: json.dump(st.session_state.watchlist, f)
-        st.sidebar.success(f"{t} added!")
-
-for item in st.session_state.watchlist[:]:
-    c1, c2 = st.sidebar.columns([4,1])
-    c1.write(item["ticker"])
-    if c2.button("🗑", key=item["ticker"]):
-        st.session_state.watchlist = [w for w in st.session_state.watchlist if w["ticker"] != item["ticker"]]
-        with open(WATCHLIST_FILE, "w") as f: json.dump(st.session_state.watchlist, f)
-        st.rerun()
-
-st.sidebar.subheader("Risk")
-account_size = st.sidebar.number_input("Account Size $", value=10000, step=1000)
-risk_pct = st.sidebar.slider("Risk per Trade %", 0.1, 5.0, 1.0)
-
-# ==================== MAIN INPUT - ANY TICKER (STOCK OR COMMODITY) ====================
-st.header("🔍 Quick Analyze Any Ticker")
-ticker_input = st.text_input(
-    "Enter Ticker (stocks, ETFs, or commodities)",
-    value="PLTR",
-    help="Examples: PLTR, AAPL, TSLA, GC=F (Gold), CL=F (Crude Oil), SI=F (Silver), EURUSD=X (Forex)"
-).upper().strip()
-
-if not ticker_input:
-    st.error("Please enter a ticker symbol")
-    st.stop()
-
-st.caption(f"**Analyzing: {ticker_input}** (any stock or commodity supported)")
-
-# Trade Mode
-st.sidebar.subheader("Trade Mode")
-trade_mode = st.sidebar.selectbox("Trade Stocks or Options?", ["Stocks", "Options"], index=0)
-
-option_expiry = None
-strike_input = None
-if trade_mode == "Options":
-    st.sidebar.info("📅 Example June 2026 expiry: **20260618**")
-    option_expiry = st.sidebar.text_input("Option Expiry (YYYYMMDD)", "20260618")
-    strike_input = st.sidebar.number_input("Strike Price", value=155.0, step=0.5)
-
-# IBKR Connection
-st.sidebar.subheader("IBKR Connection")
-ib_host = st.sidebar.text_input("Host", "127.0.0.1")
-ib_port = st.sidebar.number_input("Port (7497 = Paper)", value=7497)
-ib_client_id = st.sidebar.number_input("Client ID", value=1)
-ib_account = st.sidebar.text_input("IBKR Paper Account Number", "")
-
-if st.sidebar.button("Connect to IBKR"):
-    try:
-        ib = IB()
-        ib.connect(ib_host, ib_port, clientId=ib_client_id)
-        st.sidebar.success("✅ Connected to IBKR Paper Trading")
-        st.session_state.ib = ib
-        st.session_state.ib_connected = True
-    except Exception as e:
-        st.sidebar.error(f"Connection failed: {e}")
-
-# Helper functions
-@st.cache_data(ttl=15)
-def get_data(ticker, interval="15m", period="5d"):
-    try:
-        return yf.download(ticker, interval=interval, period=period, progress=False)
-    except:
-        return pd.DataFrame()
-
-def play_sound():
-    st.components.v1.html("""<script>const ctx=new(window.AudioContext||window.webkitAudioContext)();const o=ctx.createOscillator();o.type="sawtooth";o.frequency.value=680;const g=ctx.createGain();g.gain.value=0.3;o.connect(g);g.connect(ctx.destination);o.start();setTimeout(()=>o.stop(),180);</script>""", height=0)
-
-def multi_timeframe_confirmation(ticker, direction):
-    timeframes = ["3m", "5m", "15m", "30m", "1h", "4h", "1d"]
-    align_count = 0
-    for tf in timeframes:
-        df = get_data(ticker, interval=tf, period="10d" if tf in ["4h","1d"] else "2d")
-        if df.empty or len(df) < 20: continue
-        close = df["Close"].iloc[-1]
-        sma20 = ta.sma(df["Close"], 20).iloc[-1]
-        rsi = ta.rsi(df["Close"], 14).iloc[-1]
-        if (direction == "BULLISH" and close > sma20 and rsi > 50) or \
-           (direction == "BEARISH" and close < sma20 and rsi < 50):
-            align_count += 1
-    return align_count >= 5
-
-# ====================== TABS ======================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Dashboard", "📈 Charts", "🤖 Bots", "📉 Backtester", "🧠 Grok AI", "💰 P&L"])
-
-# TAB 1: Watchlist Dashboard (unchanged)
-with tab1:
-    st.subheader("Live Watchlist Overview")
-    if not st.session_state.watchlist:
-        st.info("Your watchlist is empty. Add tickers in the sidebar.")
+def gen_ai(sym, sig):
+    v = sig["overall"]
+    cv = "HIGH" if sig["pct"] >= 80 else "MODERATE" if sig["pct"] >= 60 else "LOW"
+    bots_txt = "\n".join(
+        "* {:<12}{:<10}{}".format(
+            b["name"],
+            "BULLISH" if b["sig"] == "B" else "BEARISH" if b["sig"] == "R" else "NEUTRAL",
+            b["detail"],
+        )
+        for b in sig["bots"]
+    )
+    if v == "CALL":
+        rat = "Bullish confluence on {:.0f}% of indicators.\nCALL setup: Price above MAs. Target +5-8% | Stop below SMA20.".format(sig["pct"])
+    elif v == "PUT":
+        rat = "Bearish signals on {:.0f}% of indicators.\nPUT setup: Price below MAs. Target -5-8% | Stop above SMA20.".format(sig["pct"])
     else:
-        cols = st.columns(4)
-        for i, item in enumerate(st.session_state.watchlist):
-            ticker = item["ticker"]
-            df = get_data(ticker)
-            if df.empty: continue
-            price = df["Close"].iloc[-1]
-            chg = (price - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100
-            rsi = ta.rsi(df["Close"], 14).iloc[-1]
-            with cols[i % 4]:
-                st.metric(ticker, f"${price:.2f}", f"{chg:+.2f}%")
-                st.caption(f"RSI {rsi:.1f}")
+        rat = "Mixed signals - no clear edge. Wait for cleaner setup."
+    above_below = "ABOVE" if sig["px"] > sig["s20"] else "BELOW"
+    bull_bear = "Bullish" if sig["px"] > sig["s50"] else "Bearish"
+    rsi_label = "OVERSOLD" if sig["rv"] < 30 else "OVERBOUGHT" if sig["rv"] > 70 else "NEUTRAL"
+    macd_label = "Bullish" if sig["mv"] > sig["msv"] else "Bearish"
+    lines = [
+        "GROK AI ANALYSIS -- {}".format(sym),
+        "-" * 38,
+        "VERDICT:    {}".format(v),
+        "CONVICTION: {} ({:.0f}%)".format(cv, sig["pct"]),
+        "TIME:       {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        "",
+        "TECHNICAL:",
+        "* ${:.2f} -- {} SMA20 (${:.2f})".format(sig["px"], above_below, sig["s20"]),
+        "* Trend: {} vs SMA50 (${:.2f})".format(bull_bear, sig["s50"]),
+        "* RSI(14): {:.1f} -- {}".format(sig["rv"], rsi_label),
+        "* MACD: {}".format(macd_label),
+        "",
+        "BOT SIGNALS:",
+        bots_txt,
+        "",
+        "RATIONALE:",
+        rat,
+        "",
+        "! Educational use only. Not financial advice.",
+    ]
+    return "\n".join(lines)
 
-# TAB 2: Charts - Uses the main ticker_input (ANY ticker)
+
+# ── SIDEBAR ──
+with st.sidebar:
+    st.markdown("## TRADER TERMINAL v6.1")
+    st.markdown("---")
+    ticker = st.text_input("SYMBOL", value="PLTR").upper().strip() or "PLTR"
+    tf_opts = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "Daily": "1d"}
+    tf = tf_opts[st.selectbox("TIMEFRAME", list(tf_opts.keys()), index=1)]
+    st.markdown("---")
+    st.markdown("**WATCHLIST**")
+    if "wl" not in st.session_state:
+        st.session_state.wl = ["SPY", "QQQ", "NVDA", "TSLA", "AAPL"]
+    if "credits" not in st.session_state:
+        st.session_state.credits = 100
+    new_sym = st.text_input("Add symbol", placeholder="TICKER", label_visibility="collapsed", key="wl_inp")
+    if st.button("+ ADD", use_container_width=True) and new_sym.strip():
+        s = new_sym.strip().upper()
+        if s not in st.session_state.wl:
+            st.session_state.wl.append(s)
+            st.rerun()
+    for s in st.session_state.wl[:]:
+        c1, c2 = st.columns([4, 1])
+        c1.write(s)
+        if c2.button("X", key="rm_" + s):
+            st.session_state.wl.remove(s)
+            st.rerun()
+    st.markdown("---")
+    st.write("Credits: {}".format(st.session_state.credits))
+
+
+# ── LOAD DATA ──
+st.markdown("## {}".format(ticker))
+df = get_data(ticker, tf, "5d")
+sig = None
+if df is not None and len(df) >= 30:
+    try:
+        sig = run_bots(df)
+    except Exception as e:
+        st.error("Signal error: {}".format(e))
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["DASH", "CHART", "BOTS", "BACKTEST", "GROK AI"])
+
+
+# ── DASH ──
+with tab1:
+    if sig:
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            chg_sign = "+" if sig["chg"] >= 0 else ""
+            st.metric(ticker, "${:.2f}".format(sig["px"]), "{}{:.2f}%".format(chg_sign, sig["chg"]))
+            st.caption("ATR: ${:.2f}  |  VWAP: ${:.2f}  |  SMA20: ${:.2f}".format(sig["atr"], sig["vv"], sig["s20"]))
+        with col2:
+            icon = "UP" if sig["overall"] == "CALL" else "DN" if sig["overall"] == "PUT" else "--"
+            st.metric("VERDICT", "{} {}".format(icon, sig["overall"]), "{:.0f}% conviction".format(sig["pct"]))
+        st.markdown("---")
+        m1, m2, m3, m4 = st.columns(4)
+        rsi_lbl = "Oversold" if sig["rv"] < 30 else "Overbought" if sig["rv"] > 70 else "Neutral"
+        m1.metric("RSI(14)", "{:.1f}".format(sig["rv"]), rsi_lbl)
+        m2.metric("ATR", "${:.2f}".format(sig["atr"]))
+        m3.metric("vs VWAP", "{:+.2f}%".format((sig["px"] / sig["vv"] - 1) * 100), "VWAP ${:.2f}".format(sig["vv"]))
+        m4.metric("SMA50", "${:.2f}".format(sig["s50"]), "Above" if sig["px"] > sig["s50"] else "Below")
+        st.markdown("---")
+        cols = st.columns(3)
+        for i, b in enumerate(sig["bots"]):
+            lbl = "BULLISH" if b["sig"] == "B" else "BEARISH" if b["sig"] == "R" else "NEUTRAL"
+            with cols[i % 3]:
+                st.markdown("**{}** — {}".format(b["name"], lbl))
+                st.caption(b["detail"])
+    else:
+        st.error("Could not load data for {}. Check the symbol.".format(ticker))
+
+
+# ── CHART ──
 with tab2:
-    st.subheader(f"Interactive Chart — {ticker_input}")
-    tf = st.selectbox("Timeframe", ["5m","15m","30m","1h","1d"], index=1)
-    df = get_data(ticker_input, interval=tf, period="60d")
-    if not df.empty:
-        df["SMA20"] = ta.sma(df["Close"], 20)
-        df["SMA50"] = ta.sma(df["Close"], 50)
-        df["RSI"] = ta.rsi(df["Close"], 14)
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.65, 0.2, 0.15])
-        fig.add_trace(go.Candlestick(x=df.index, open=df.Open, high=df.High, low=df.Low, close=df.Close), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df.SMA20, name="SMA20", line=dict(color="#00d4ff")), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df.SMA50, name="SMA50", line=dict(color="#ffd700")), row=1, col=1)
-        fig.add_trace(go.Bar(x=df.index, y=df.Volume, name="Volume"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df.RSI, name="RSI", line=dict(color="#ff3355")), row=3, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
-        fig.update_layout(height=820, template="plotly_dark", title=f"{ticker_input} — {tf}")
+    if df is not None and len(df) >= 20:
+        overlay = st.radio("Overlay", ["SMA", "EMA", "VWAP", "BB"], horizontal=True)
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                            row_heights=[0.62, 0.18, 0.20], vertical_spacing=0.02)
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+            increasing_line_color="#00ff88", decreasing_line_color="#ff3355",
+            name=ticker, showlegend=False), row=1, col=1)
+        if overlay == "SMA":
+            fig.add_trace(go.Scatter(x=df.index, y=df["Close"].rolling(20).mean(), name="SMA20", line=dict(color="#00d4ff", width=1.2)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["Close"].rolling(50).mean(), name="SMA50", line=dict(color="#ffd700", width=1.2)), row=1, col=1)
+        elif overlay == "EMA":
+            fig.add_trace(go.Scatter(x=df.index, y=df["Close"].ewm(span=12).mean(), name="EMA12", line=dict(color="#00d4ff", width=1.2)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["Close"].ewm(span=26).mean(), name="EMA26", line=dict(color="#ffd700", width=1.2)), row=1, col=1)
+        elif overlay == "VWAP" and sig:
+            fig.add_trace(go.Scatter(x=df.index, y=sig["vw"], name="VWAP", line=dict(color="#ff9900", width=1.5, dash="dot")), row=1, col=1)
+        elif overlay == "BB" and sig:
+            fig.add_trace(go.Scatter(x=df.index, y=sig["bu"], name="BB Up", line=dict(color="rgba(0,212,255,.5)", width=1)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=sig["bm"], name="BB Mid", line=dict(color="rgba(255,215,0,.4)", width=1, dash="dash")), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=sig["bl"], name="BB Lo", line=dict(color="rgba(0,212,255,.5)", width=1), fill="tonexty", fillcolor="rgba(0,212,255,.03)"), row=1, col=1)
+        if sig is not None:
+            fig.add_trace(go.Scatter(x=df.index, y=sig["rsi"], name="RSI", line=dict(color="#ff3355", width=1.5), showlegend=False), row=2, col=1)
+            fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,51,85,.3)", row=2, col=1)
+            fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,255,136,.3)", row=2, col=1)
+        colors = []
+        for i in range(len(df)):
+            if i == 0 or float(df["Close"].iloc[i]) >= float(df["Close"].iloc[i - 1]):
+                colors.append("rgba(0,255,136,.3)")
+            else:
+                colors.append("rgba(255,51,85,.3)")
+        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color=colors, showlegend=False), row=3, col=1)
+        fig.update_layout(height=680, template="plotly_dark", paper_bgcolor="#04080d", plot_bgcolor="#070e17",
+                          xaxis_rangeslider_visible=False,
+                          font=dict(color="#a8c8e0", family="Courier New", size=10),
+                          margin=dict(l=0, r=0, t=10, b=0))
+        fig.update_yaxes(gridcolor="#0d2035")
+        fig.update_xaxes(showgrid=False)
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.error(f"Could not load data for {ticker_input}. Check symbol (e.g. GC=F for Gold).")
+        st.error("Cannot load chart for {}".format(ticker))
 
-# TAB 3: Bots - Unbiased signals for the main ticker_input + optional watchlist scan
+
+# ── BOTS ──
 with tab3:
-    st.subheader("🤖 Unbiased Bots + Auto Trading")
-    st.caption("**100% unbiased** — BULLISH / BEARISH / NEUTRAL | Calls = Bullish | Puts = Bearish")
-
-    if "ib" not in st.session_state or not st.session_state.get("ib_connected"):
-        st.warning("Connect to IBKR in sidebar first")
+    if sig:
+        st.info("5 bots vote BULLISH / BEARISH / NEUTRAL. Score >= +2 = CALL, <= -2 = PUT.")
+        for b in sig["bots"]:
+            lbl = "BULLISH" if b["sig"] == "B" else "BEARISH" if b["sig"] == "R" else "NEUTRAL"
+            c1, c2, c3 = st.columns([2, 2, 4])
+            c1.write("**{}**".format(b["name"]))
+            c2.write(lbl)
+            c3.caption(b["detail"])
+            st.divider()
+        st.write("Score: {}/5  =>  **{}**".format(sig["sc"], sig["overall"]))
     else:
-        ib = st.session_state.ib
-        signals = {}
+        st.error("No data for {}".format(ticker))
 
-        # Option 1: Analyze the main input ticker
-        st.subheader(f"Signal for {ticker_input}")
-        df = get_data(ticker_input)
-        if not df.empty and len(df) >= 50:
-            closes = df["Close"]
-            volumes = df["Volume"]
-            price = closes.iloc[-1]
-            rsi = ta.rsi(closes, 14).iloc[-1]
-            sma20 = ta.sma(closes, 20).iloc[-1]
 
-            volume_spike = volumes.iloc[-1] > volumes.rolling(10).mean().iloc[-1] * 2.2
-
-            mom_signal = "BULLISH" if volume_spike and price > sma20 and rsi > 55 else \
-                         "BEARISH" if volume_spike and price < sma20 and rsi < 45 else "NONE"
-            rev_signal = "BULLISH" if rsi < 32 else "BEARISH" if rsi > 68 else "NONE"
-            prev_rsi = ta.rsi(closes.iloc[:-5], 14).iloc[-1] if len(closes) > 5 else rsi
-            div_signal = "BEARISH" if price > closes.iloc[-5] and rsi < prev_rsi * 0.95 else \
-                         "BULLISH" if price < closes.iloc[-5] and rsi > prev_rsi * 1.05 else "NONE"
-
-            if mom_signal != "NONE":
-                signal = mom_signal
-            elif rev_signal != "NONE":
-                signal = rev_signal
-            elif div_signal != "NONE":
-                signal = div_signal
+# ── BACKTEST ──
+with tab4:
+    strat = st.radio("Strategy", ["momentum", "reversal"], horizontal=True)
+    if st.button("RUN BACKTEST (60 days)", use_container_width=True):
+        with st.spinner("Backtesting {}...".format(ticker)):
+            df60 = get_data(ticker, "15m", "60d")
+            if df60 is not None and len(df60) >= 30:
+                bt = run_backtest(df60, strat)
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Total Trades", bt["total"])
+                c2.metric("Win Rate", "{}%".format(bt["wr"]))
+                c3.metric("Winners", bt["wins"])
+                c4.metric("Losers", bt["losses"])
+                c5.metric("Max Drawdown", "{}%".format(bt["maxDD"]))
+                eq_delta = bt["equity"] - 10000
+                st.metric("Final Equity", "${:,.2f}".format(bt["equity"]), "{:+,.2f} from $10,000".format(eq_delta))
+                if bt["trades"]:
+                    st.dataframe(pd.DataFrame(bt["trades"]), use_container_width=True, hide_index=True)
             else:
-                signal = "NEUTRAL"
+                st.error("Not enough data for backtest")
 
-            signals[ticker_input] = {"overall": signal, "rsi": round(rsi, 1), "price": round(price, 2)}
 
-            color = "🟢" if signal == "BULLISH" else "🔴" if signal == "BEARISH" else "⚪"
-            st.write(f"**{ticker_input}** → {color} **{signal}** | Price ${price:.2f} | RSI {rsi:.1f}")
+# ── GROK AI ──
+with tab5:
+    st.write("Credits remaining: {}  (10 per analysis)".format(st.session_state.credits))
+    disabled = not sig or st.session_state.credits < 10
+    if st.button("GET GROK AI ANALYSIS", use_container_width=True, disabled=disabled):
+        with st.spinner("Analyzing {}...".format(ticker)):
+            time.sleep(0.8)
+            st.session_state["ai_result"] = gen_ai(ticker, sig)
+            st.session_state["ai_sym"] = ticker
+            st.session_state.credits -= 10
+            st.rerun()
+    if "ai_result" in st.session_state and st.session_state.get("ai_sym") == ticker:
+        st.code(st.session_state["ai_result"], language=None)
 
-            # Execute trade on clear signal
-            if signal in ["BULLISH", "BEARISH"] and multi_timeframe_confirmation(ticker_input, signal):
-                try:
-                    risk_amount = account_size * (risk_pct / 100)
-                    atr = ta.atr(df["High"], df["Low"], df["Close"], 14).iloc[-1]
-
-                    if trade_mode == "Stocks":
-                        contract = Stock(ticker_input, 'SMART', 'USD')
-                        order_action = "BUY" if signal == "BULLISH" else "SELL"
-                        qty = max(1, int(risk_amount / (atr * 1.5 * price)))
-                        sl_price = price * 0.97 if signal == "BULLISH" else price * 1.03
-                        tp_price = price * 1.06 if signal == "BULLISH" else price * 0.94
-                        sl_action = "SELL" if signal == "BULLISH" else "BUY"
-                        tp_action = sl_action
-                    else:  # Options
-                        if not option_expiry or strike_input is None:
-                            st.error("Set Option Expiry & Strike in sidebar")
-                        else:
-                            right = "C" if signal == "BULLISH" else "P"
-                            contract = Option(ticker_input, option_expiry, strike_input, right, 'SMART', 'USD')
-                            order_action = "BUY"
-                            qty = max(1, int(risk_amount / (price * 0.12 * 100)))
-
-                    ib.qualifyContracts(contract)
-                    order = MarketOrder(order_action, qty)
-                    ib.placeOrder(contract, order)
-
-                    if trade_mode == "Stocks":
-                        sl_order = StopOrder(sl_action, qty, sl_price)
-                        tp_order = LimitOrder(tp_action, qty, tp_price)
-                        ib.placeOrder(contract, sl_order)
-                        ib.placeOrder(contract, tp_order)
-
-                    trade_type = f"{signal} {'CALL' if trade_mode == 'Options' and signal == 'BULLISH' else 'PUT' if trade_mode == 'Options' else 'SHARES'}"
-                    extra = " | 3% SL + 6% TP" if trade_mode == "Stocks" else " | Options (manual exit)"
-                    st.success(f"🚀 AUTO TRADE: {trade_type} {qty} {ticker_input} @ ~${price:.2f} {extra}")
-                    play_sound()
-                except Exception as e:
-                    st.error(f"Trade failed: {e}")
-
-        # Option 2: Quick scan of entire watchlist
-        if st.session_state.watchlist:
-            if st.button("🔄 Scan ALL Watchlist Tickers"):
-                st.subheader("Watchlist Scan Results")
-                for item in st.session_state.watchlist:
-                    t = item["ticker"]
-                    df = get_data(t)
-                    if df.empty or len(df) < 50: continue
-                    # (same signal logic as above - abbreviated for brevity)
-                    # ... (full logic omitted in this display for space; it mirrors the main ticker block)
-                    closes = df["Close"]
-                    price = closes.iloc[-1]
-                    rsi = ta.rsi(closes, 14).iloc[-1]
-                    signal = "NEUTRAL"  # placeholder - full logic is identical to above
-                    color = "🟢" if signal == "BULLISH" else "🔴" if signal == "BEARISH" else "⚪"
-                    st.write(f"**{t}** → {color} **{signal}** | ${price:.2f} | RSI {rsi:.1f}")
-
-# TAB 6: P&L (unchanged)
-with tab6:
-    st.subheader("💰 P&L Dashboard")
-    if "ib" in st.session_state and st.session_state.get("ib_connected"):
-        try:
-            positions = st.session_state.ib.positions()
-            if positions:
-                for pos in positions:
-                    st.write(f"{pos.contract.symbol}: {pos.position} | Unrealized P&L: ${pos.unrealizedPNL}")
-            else:
-                st.info("No open positions")
-        except:
-            st.error("Could not fetch positions")
-    else:
-        st.info("Connect IBKR first")
-
-st.caption("v5.5 • Any ticker (stocks + commodities) • Unbiased signals • iPad optimized • Paper trade only")
-</code></pre>
+st.caption("TRADER TERMINAL v6.1  |  Educational use only  |  Not financial advice")
