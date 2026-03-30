@@ -7,6 +7,12 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 import time
 import json
+import os
+import anthropic
+from dotenv import load_dotenv, set_key
+
+load_dotenv()  # Load ANTHROPIC_API_KEY from .env if present
+_ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 
 st.set_page_config(page_title="TRADER TERMINAL v6.1", layout="wide", page_icon="📈")
 
@@ -273,6 +279,9 @@ with st.sidebar:
         st.session_state.wl = ["SPY", "QQQ", "NVDA", "TSLA", "AAPL"]
     if "credits" not in st.session_state:
         st.session_state.credits = 100
+    # Seed API key from .env on first load
+    if "ant_key" not in st.session_state:
+        st.session_state["ant_key"] = os.getenv("ANTHROPIC_API_KEY", "")
     new_sym = st.text_input("Add symbol", placeholder="TICKER", label_visibility="collapsed", key="wl_inp")
     if st.button("+ ADD", use_container_width=True) and new_sym.strip():
         s = new_sym.strip().upper()
@@ -287,6 +296,110 @@ with st.sidebar:
             st.rerun()
     st.markdown("---")
     st.write("Credits: {}".format(st.session_state.credits))
+    st.markdown("---")
+    st.markdown("**ANTHROPIC KEY**")
+    _key_display = ("sk-ant-..." + st.session_state["ant_key"][-6:]) if st.session_state["ant_key"] else ""
+    _new_key = st.text_input(
+        "API Key", type="password",
+        placeholder="sk-ant-api03-...",
+        value=_key_display,
+        label_visibility="collapsed",
+        key="ant_key_input",
+    )
+    _col1, _col2 = st.columns(2)
+    if _col1.button("SAVE", use_container_width=True, key="save_key_btn"):
+        _raw = _new_key.strip()
+        if _raw.startswith("sk-ant-"):
+            st.session_state["ant_key"] = _raw
+            set_key(_ENV_PATH, "ANTHROPIC_API_KEY", _raw)
+            st.success("Key saved to .env")
+        else:
+            st.error("Key must start with sk-ant-")
+    if _col2.button("CLEAR", use_container_width=True, key="clear_key_btn"):
+        st.session_state["ant_key"] = ""
+        set_key(_ENV_PATH, "ANTHROPIC_API_KEY", "")
+        st.rerun()
+    if st.session_state["ant_key"]:
+        st.caption("Key loaded ✓")
+    else:
+        st.caption("No key set")
+
+
+# ── TRADESWARM ────────────────────────────────────────────────────────────────
+SWARM_BOTS = [
+    {"id": "ARIA",  "role": "MOMENTUM SCANNER",  "color": "#00ff88", "icon": "◈",
+     "tags": ["RSI-14", "Volume", "Bollinger", "Momentum"]},
+    {"id": "NEXUS", "role": "TREND ANALYST",      "color": "#00cfff", "icon": "⬡",
+     "tags": ["50 SMA", "200 SMA", "EMA Cross", "VWAP"]},
+    {"id": "SIGMA", "role": "SENTIMENT READER",   "color": "#ff6b35", "icon": "⬟",
+     "tags": ["Put/Call", "IV Rank", "Dark Pool", "Options Flow"]},
+    {"id": "DELTA", "role": "DIVERGENCE HUNTER",  "color": "#c084fc", "icon": "⬠",
+     "tags": ["MACD Div", "RSI Div", "CVD Delta", "Exhaustion"]},
+]
+
+
+def _swarm_prompt(sym):
+    return (
+        'Analyze stock {}. Reply with ONLY this JSON (no markdown, no backticks, just the object):\n'
+        '{{"ARIA":{{"verdict":"CALL","confidence":72,"analysis":"Two sentences about {} RSI and momentum.",'
+        '"rsi":58,"vol":112,"mom":65}},'
+        '"NEXUS":{{"verdict":"CALL","confidence":74,"analysis":"Two sentences about {} moving averages.",'
+        '"sma":68,"ema":72,"trend":70}},'
+        '"SIGMA":{{"verdict":"PUT","confidence":69,"analysis":"Two sentences about {} options flow.",'
+        '"pcr":62,"ivr":45,"flow":55}},'
+        '"DELTA":{{"verdict":"PUT","confidence":76,"rev":"NONE","analysis":"Two sentences about {} MACD/RSI divergence.",'
+        '"macd":65,"rsid":58,"cvd":60}}}}\n'
+        'Rules: Each bot different focus. Verdicts may differ. '
+        'DELTA rev = BULLISH_REVERSAL, BEARISH_REVERSAL, or NONE. All numbers 0-100. Be specific to {}.'
+    ).format(sym, sym, sym, sym, sym, sym)
+
+
+def _extract_json(text):
+    try:
+        s = text.strip()
+        a, b = s.find('{'), s.rfind('}')
+        if a == -1 or b == -1:
+            return None
+        return json.loads(s[a:b + 1])
+    except Exception:
+        return None
+
+
+def _parse_swarm_bot(bot_id, data):
+    d = data.get(bot_id, {})
+    verdict = "CALL" if "CALL" in str(d.get("verdict", "")).upper() else "PUT"
+    confidence = min(94, max(55, int(d.get("confidence", 68))))
+    analysis = str(d.get("analysis", "Analysis complete.")).strip()
+    reversal = None
+    if bot_id == "DELTA":
+        rev = str(d.get("rev", "NONE"))
+        reversal = rev if rev in ("BULLISH_REVERSAL", "BEARISH_REVERSAL") else "NONE"
+    metrics_map = {
+        "ARIA":  [("RSI-14", d.get("rsi", 55), 100), ("Volume %", d.get("vol", 55), 150), ("Momentum", d.get("mom", 55), 100)],
+        "NEXUS": [("50 SMA Score", d.get("sma", 55), 100), ("EMA Strength", d.get("ema", 55), 100), ("Trend Align", d.get("trend", 55), 100)],
+        "SIGMA": [("Put/Call Score", d.get("pcr", 55), 100), ("IV Rank", d.get("ivr", 55), 100), ("Bullish Flow", d.get("flow", 55), 100)],
+        "DELTA": [("MACD Divergence", d.get("macd", 55), 100), ("RSI Divergence", d.get("rsid", 55), 100), ("CVD Imbalance", d.get("cvd", 55), 100)],
+    }
+    metrics = [{"label": lbl, "value": min(mx, max(0, float(v or 55))), "max": mx}
+               for lbl, v, mx in metrics_map.get(bot_id, [])]
+    return {"verdict": verdict, "confidence": confidence, "analysis": analysis,
+            "metrics": metrics, "reversal": reversal}
+
+
+def call_tradeswarm(sym, api_key):
+    """Call Claude API and return list of 4 parsed bot results, or raise."""
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system="You are a stock analysis API. Output ONLY a raw JSON object. No markdown. No explanation. Just JSON.",
+        messages=[{"role": "user", "content": _swarm_prompt(sym)}],
+    )
+    raw = "".join(c.text for c in msg.content if hasattr(c, "text")).strip()
+    data = _extract_json(raw)
+    if data is None:
+        raise ValueError("Could not parse JSON from response: " + raw[:200])
+    return [_parse_swarm_bot(b["id"], data) for b in SWARM_BOTS], raw
 
 
 # ── LOAD DATA ──
@@ -299,7 +412,7 @@ if df is not None and len(df) >= 30:
     except Exception as e:
         st.error("Signal error: {}".format(e))
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["DASH", "CHART", "BOTS", "BACKTEST", "GROK AI"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["DASH", "CHART", "BOTS", "BACKTEST", "GROK AI", "TRADESWARM ◈"])
 
 
 # ── DASH ──
@@ -450,5 +563,161 @@ with tab5:
             st.rerun()
     if "ai_result" in st.session_state and st.session_state.get("ai_sym") == ticker:
         st.code(st.session_state["ai_result"], language=None)
+
+# ── TRADESWARM ──
+with tab6:
+    st.markdown("""
+    <div style="text-align:center;padding:10px 0 18px">
+      <div style="font-size:22px;font-weight:900;letter-spacing:7px;
+        background:linear-gradient(90deg,#00ff88,#00cfff,#c084fc,#ff6b35);
+        -webkit-background-clip:text;-webkit-text-fill-color:transparent">TRADESWARM</div>
+      <div style="color:#334;font-size:10px;letter-spacing:3px;margin-top:2px">
+        4-BOT PUT/CALL ANALYZER · POWERED BY CLAUDE
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    _api_key = st.session_state.get("ant_key", "")
+    if not _api_key:
+        st.warning("Add your Anthropic API key in the sidebar to use TRADESWARM.")
+    else:
+        st.caption("Using key: sk-ant-...{}  |  Ticker: **{}**".format(_api_key[-4:], ticker))
+
+    _can_run = bool(_api_key) and sig is not None
+    if st.button("▶ ANALYZE WITH TRADESWARM", use_container_width=True,
+                 disabled=not _can_run, key="swarm_run_btn"):
+        with st.spinner("Deploying swarm on {}...".format(ticker)):
+            try:
+                _results, _raw = call_tradeswarm(ticker, _api_key)
+                st.session_state["swarm_result"] = _results
+                st.session_state["swarm_sym"] = ticker
+                st.session_state["swarm_raw"] = _raw
+            except Exception as _e:
+                st.session_state["swarm_error"] = str(_e)
+                st.session_state["swarm_sym"] = ticker
+                st.session_state.pop("swarm_result", None)
+
+    # ── Results ──
+    if st.session_state.get("swarm_sym") == ticker:
+        _err = st.session_state.get("swarm_error")
+        _res = st.session_state.get("swarm_result")
+
+        if _err:
+            st.error("Error: " + _err)
+
+        if _res:
+            # Bot cards — 2 columns
+            _col_l, _col_r = st.columns(2)
+            for _i, (_bot, _r) in enumerate(zip(SWARM_BOTS, _res)):
+                _col = _col_l if _i % 2 == 0 else _col_r
+                _vc  = "#00ff88" if _r["verdict"] == "CALL" else "#ff4466"
+                _bc  = _bot["color"]
+                _metrics_html = "".join(
+                    '<div style="margin-bottom:6px">'
+                    '<div style="display:flex;justify-content:space-between;font-size:10px;color:#556">'
+                    '<span>{}</span><span style="color:{}">{:.0f}</span></div>'
+                    '<div style="height:4px;background:#0f0f20;border-radius:3px;overflow:hidden;margin-top:2px">'
+                    '<div style="width:{:.0f}%;height:100%;background:linear-gradient(90deg,{}55,{});border-radius:3px"></div>'
+                    '</div></div>'.format(m["label"], _bc, m["value"],
+                                         min(100, m["value"] / m["max"] * 100), _bc, _bc)
+                    for m in _r["metrics"]
+                )
+                _rev_html = ""
+                if _r.get("reversal") and _r["reversal"] != "NONE":
+                    _rc = "#00ff88" if _r["reversal"] == "BULLISH_REVERSAL" else "#ff4466"
+                    _rl = "⬆ BULLISH REVERSAL" if _r["reversal"] == "BULLISH_REVERSAL" else "⬇ BEARISH REVERSAL"
+                    _rev_html = ('<div style="margin-top:8px;padding:4px 9px;background:{0}10;'
+                                 'border:1px solid {0}40;border-radius:6px;color:{0};'
+                                 'font-size:9px;font-weight:800">{1}</div>').format(_rc, _rl)
+                _tags_html = "".join(
+                    '<span style="padding:2px 5px;border-radius:3px;font-size:8px;'
+                    'background:{0}0c;border:1px solid {0}18;color:{0}55;margin-right:3px">{1}</span>'.format(_bc, t)
+                    for t in _bot["tags"]
+                )
+                _col.markdown("""
+                <div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);
+                  border:1px solid {bc}40;border-radius:10px;padding:14px;margin-bottom:10px">
+                  <div style="display:flex;align-items:center;gap:9px;margin-bottom:8px">
+                    <span style="font-size:18px;color:{bc}">{icon}</span>
+                    <div>
+                      <div style="color:{bc};font-weight:800;font-size:13px;letter-spacing:1px">{id}</div>
+                      <div style="color:{bc}66;font-size:8px">{role}</div>
+                    </div>
+                    <div style="margin-left:auto;padding:2px 10px;border-radius:20px;
+                      background:{vc}12;border:1px solid {vc}44;color:{vc};
+                      font-weight:800;font-size:11px;letter-spacing:2px">{verdict}</div>
+                  </div>
+                  <div style="margin-bottom:8px">{tags}</div>
+                  <div style="background:#05050f;border-radius:7px;padding:10px;
+                    border:1px solid #141428;font-size:11px;line-height:1.8;
+                    color:#8899b0;margin-bottom:8px">{analysis}</div>
+                  {metrics}
+                  {rev}
+                  <div style="display:flex;justify-content:space-between;margin-top:8px">
+                    <span style="color:#222;font-size:9px">CONFIDENCE</span>
+                    <span style="color:{bc};font-size:11px;font-weight:800">{conf}%</span>
+                  </div>
+                </div>""".format(
+                    bc=_bc, icon=_bot["icon"], id=_bot["id"], role=_bot["role"],
+                    vc=_vc, verdict=_r["verdict"], tags=_tags_html,
+                    analysis=_r["analysis"], metrics=_metrics_html,
+                    rev=_rev_html, conf=_r["confidence"],
+                ), unsafe_allow_html=True)
+
+            # Verdict panel
+            _calls = sum(1 for r in _res if r["verdict"] == "CALL")
+            _puts  = len(_res) - _calls
+            _final = "CALL" if _calls >= _puts else "PUT"
+            _avg_c = round(sum(r["confidence"] for r in _res) / len(_res))
+            _strength = "STRONG" if _avg_c >= 80 else "MODERATE" if _avg_c >= 66 else "WEAK"
+            _fc = "#00ff88" if _final == "CALL" else "#ff4466"
+            _delta_rev = _res[3].get("reversal") if len(_res) > 3 else None
+            _rev_badge = ""
+            if _delta_rev and _delta_rev != "NONE":
+                _rc2 = "#00ff88" if _delta_rev == "BULLISH_REVERSAL" else "#ff4466"
+                _rl2 = "⚡ BULLISH REVERSAL" if _delta_rev == "BULLISH_REVERSAL" else "⚡ BEARISH REVERSAL"
+                _rev_badge = ('<div style="margin:0 auto 14px;padding:7px 16px;display:inline-block;'
+                              'background:{0}10;border:1px solid {0}44;border-radius:9px;">'
+                              '<span style="color:{0};font-size:13px;font-weight:800;letter-spacing:2px">'
+                              '{1}</span></div>').format(_rc2, _rl2)
+            _votes = "".join(
+                '<div style="display:flex;flex-direction:column;align-items:center;gap:3px">'
+                '<span style="color:{bc};font-size:9px">{id}</span>'
+                '<span style="padding:2px 9px;border-radius:12px;background:{vc}14;'
+                'border:1px solid {vc}44;color:{vc};font-size:11px;font-weight:800">{v}</span>'
+                '</div>'.format(bc=b["color"], id=b["id"],
+                                vc="#00ff88" if r["verdict"]=="CALL" else "#ff4466",
+                                v=r["verdict"])
+                for b, r in zip(SWARM_BOTS, _res)
+            )
+            st.markdown("""
+            <div style="background:linear-gradient(145deg,#07071a,#0c0c22);
+              border:2px solid {fc};border-radius:13px;padding:22px;text-align:center;
+              box-shadow:0 0 60px {fc}18;margin-top:4px">
+              <div style="color:#333;font-size:10px;letter-spacing:3px;margin-bottom:4px">▸ 4-BOT CONSENSUS ◂</div>
+              <div style="color:#444;font-size:10px;margin-bottom:12px">
+                {ticker} · {calls}/4 CALL · {puts}/4 PUT
+              </div>
+              <div style="display:flex;justify-content:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+                {votes}
+              </div>
+              <div style="font-size:52px;font-weight:900;color:{fc};letter-spacing:10px;
+                line-height:1;text-shadow:0 0 40px {fc}66;margin-bottom:5px">{final}</div>
+              <div style="color:{fc}77;font-size:12px;letter-spacing:4px;margin-bottom:12px">
+                {strength} SIGNAL · {avgc}% CONFIDENCE
+              </div>
+              {rev_badge}
+              <div style="display:inline-block;padding:5px 14px;background:#ffffff06;
+                border:1px solid #181830;border-radius:7px;color:#334;font-size:10px;margin-top:6px">
+                ⚠ AI analysis only — not financial advice
+              </div>
+            </div>""".format(
+                fc=_fc, ticker=ticker, calls=_calls, puts=_puts,
+                votes=_votes, final=_final, strength=_strength, avgc=_avg_c,
+                rev_badge=_rev_badge,
+            ), unsafe_allow_html=True)
+
+            # Raw response toggle
+            with st.expander("🔍 Raw API response"):
+                st.code(st.session_state.get("swarm_raw", ""), language="json")
 
 st.caption("TRADER TERMINAL v6.1  |  Educational use only  |  Not financial advice")
