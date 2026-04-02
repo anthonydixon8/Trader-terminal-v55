@@ -1,6 +1,7 @@
 import streamlit as st
 import anthropic
 import yfinance as yf
+import requests
 import pandas as pd
 import numpy as np
 import json
@@ -39,96 +40,129 @@ BOTS = [
     {"id": "ARIA",  "role": "MOMENTUM SCANNER",  "color": "#00ff88", "icon": "◈",
      "tags": ["RSI-14", "Volume", "Bollinger", "Momentum"]},
     {"id": "NEXUS", "role": "TREND ANALYST",      "color": "#00cfff", "icon": "⬡",
-     "tags": ["50 SMA", "200 SMA", "EMA Cross", "VWAP"]},
+     "tags": ["SMA 7/20/50", "200 SMA", "EMA Cross", "VWAP"]},
     {"id": "SIGMA", "role": "SENTIMENT READER",   "color": "#ff6b35", "icon": "⬟",
      "tags": ["Put/Call", "IV Rank", "Dark Pool", "Options Flow"]},
     {"id": "DELTA", "role": "DIVERGENCE HUNTER",  "color": "#c084fc", "icon": "⬠",
      "tags": ["MACD Div", "RSI Div", "CVD Delta", "Exhaustion"]},
+    {"id": "ATLAS", "role": "MULTI-TIMEFRAME",    "color": "#ffd700", "icon": "◎",
+     "tags": ["3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W", "1M"]},
 ]
 
-# ── Technical indicators ───────────────────────────────────────────────────────
+# ── Data fetching ──────────────────────────────────────────────────────────────
+_YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Referer": "https://finance.yahoo.com/",
+}
+
+def _fetch_df(sym, interval, period):
+    """Try yf.Ticker().history() first, fall back to requests v8 API."""
+    # Primary: yfinance Ticker history (avoids proxy issues better than download)
+    try:
+        tk = yf.Ticker(sym)
+        df = tk.history(period=period, interval=interval, auto_adjust=True)
+        if not df.empty and len(df) >= 5:
+            df.index = df.index.tz_localize(None) if df.index.tzinfo is not None else df.index
+            return df
+    except Exception:
+        pass
+    # Fallback: direct Yahoo Finance v8 API via requests
+    try:
+        url = "https://query2.finance.yahoo.com/v8/finance/chart/" + sym
+        r = requests.get(url, params={"interval": interval, "range": period},
+                         headers=_YF_HEADERS, timeout=12)
+        if r.ok:
+            res = r.json()["chart"]["result"][0]
+            ts  = res["timestamp"]
+            q   = res["indicators"]["quote"][0]
+            df  = pd.DataFrame({
+                "Open": q["open"], "High": q["high"], "Low": q["low"],
+                "Close": q["close"], "Volume": q["volume"],
+            }, index=pd.to_datetime(ts, unit="s"))
+            df = df.dropna(subset=["Close"])
+            if len(df) >= 5:
+                return df
+    except Exception:
+        pass
+    return None
+
+
+def _calc_rsi(c, p=14):
+    d = c.diff()
+    g = d.clip(lower=0).ewm(com=p - 1, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(com=p - 1, adjust=False).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
+
 @st.cache_data(ttl=60)
 def fetch_market_data(sym):
-    """Fetch OHLCV and compute all technical indicators. Returns dict or None."""
+    """Fetch daily OHLCV and compute all technical indicators. Returns dict or None."""
     try:
-        df = yf.download(sym, period="6mo", interval="1d", progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if df.empty or len(df) < 30:
+        df = _fetch_df(sym, "1d", "1y")
+        if df is None or len(df) < 30:
             return None
 
         c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+        px   = float(c.iloc[-1])
+        prev = float(c.iloc[-2])
+        chg  = (px - prev) / prev * 100
 
-        def safe(s):
-            val = s.iloc[-1]
-            return float(val) if not pd.isna(val) else None
-
-        # RSI-14
-        delta = c.diff()
-        gain  = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
-        loss  = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
-        rsi   = float((100 - 100 / (1 + gain / loss.replace(0, np.nan))).iloc[-1])
+        # RSI
+        rsi_s    = _calc_rsi(c)
+        rsi      = float(rsi_s.iloc[-1])
+        rsi_prev = float(rsi_s.iloc[-2])
 
         # MACD
-        ema12 = c.ewm(span=12, adjust=False).mean()
-        ema26 = c.ewm(span=26, adjust=False).mean()
+        ema12     = c.ewm(span=12, adjust=False).mean()
+        ema26     = c.ewm(span=26, adjust=False).mean()
         macd_line = ema12 - ema26
         macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
         macd_hist = macd_line - macd_sig
 
         # SMAs / EMAs
+        sma7   = float(c.rolling(7).mean().iloc[-1])
         sma20  = float(c.rolling(20).mean().iloc[-1])
         sma50  = float(c.rolling(50).mean().iloc[-1]) if len(c) >= 50 else None
         sma200 = float(c.rolling(200).mean().iloc[-1]) if len(c) >= 200 else None
-        ema12v = float(ema12.iloc[-1])
-        ema26v = float(ema26.iloc[-1])
 
         # Bollinger %B
         bm  = c.rolling(20).mean()
         std = c.rolling(20).std()
-        bu, bl = bm + 2 * std, bm - 2 * std
-        pctB = float(((c - bl) / (bu - bl)).iloc[-1])
+        bu_, bl_ = bm + 2 * std, bm - 2 * std
+        pctB = float(((c - bl_) / (bu_ - bl_)).iloc[-1])
 
-        # VWAP (rolling daily approx)
+        # VWAP (20-period rolling approx)
         tp   = (h + l + c) / 3
         vwap = float((tp * v).rolling(20).sum().iloc[-1] / v.rolling(20).sum().iloc[-1])
 
-        # Volume spike
-        avg_vol   = float(v.iloc[-20:].mean())
+        # Volume
         last_vol  = float(v.iloc[-1])
+        avg_vol   = float(v.iloc[-20:].mean())
         vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
 
-        # Price
-        px   = float(c.iloc[-1])
-        prev = float(c.iloc[-2]) if len(c) >= 2 else px
-        chg  = (px - prev) / prev * 100
-
-        # MACD divergence hint: last bar histogram direction vs prev
         mh_last = float(macd_hist.iloc[-1])
         mh_prev = float(macd_hist.iloc[-2])
+        rsi_div = ("bullish" if (px < prev and rsi > rsi_prev)
+                   else "bearish" if (px > prev and rsi < rsi_prev)
+                   else "none")
 
-        # RSI divergence hint: price up but RSI down (or vice versa)
-        rsi_prev = float((100 - 100 / (1 + gain / loss.replace(0, np.nan))).iloc[-2])
-        price_up = px > prev
-        rsi_up   = rsi > rsi_prev
-        rsi_div  = "bullish" if (not price_up and rsi_up) else "bearish" if (price_up and not rsi_up) else "none"
+        high_52 = float(h.rolling(min(252, len(h))).max().iloc[-1])
+        low_52  = float(l.rolling(min(252, len(l))).min().iloc[-1])
 
-        # Try to get options put/call ratio
+        # Options PCR
         pcr = None
         try:
             tk   = yf.Ticker(sym)
             exps = tk.options
             if exps:
                 chain = tk.option_chain(exps[0])
-                total_put_oi  = chain.puts["openInterest"].sum()
-                total_call_oi = chain.calls["openInterest"].sum()
-                if total_call_oi > 0:
-                    pcr = round(total_put_oi / total_call_oi, 2)
+                put_oi  = chain.puts["openInterest"].sum()
+                call_oi = chain.calls["openInterest"].sum()
+                if call_oi > 0:
+                    pcr = round(put_oi / call_oi, 2)
         except Exception:
             pass
-
-        high_52 = float(h.rolling(252).max().iloc[-1]) if len(h) >= 252 else float(h.max())
-        low_52  = float(l.rolling(252).min().iloc[-1]) if len(l) >= 252 else float(l.min())
 
         return {
             "px": round(px, 2), "chg": round(chg, 2),
@@ -139,7 +173,9 @@ def fetch_market_data(sym):
             "macd_sig":  round(float(macd_sig.iloc[-1]), 4),
             "macd_hist": round(mh_last, 4),
             "macd_hist_prev": round(mh_prev, 4),
-            "ema12": round(ema12v, 2), "ema26": round(ema26v, 2),
+            "ema12": round(float(ema12.iloc[-1]), 2),
+            "ema26": round(float(ema26.iloc[-1]), 2),
+            "sma7":  round(sma7, 2),
             "sma20": round(sma20, 2),
             "sma50": round(sma50, 2) if sma50 else None,
             "sma200": round(sma200, 2) if sma200 else None,
@@ -153,79 +189,126 @@ def fetch_market_data(sym):
         return None
 
 
-def _build_prompt(sym, d):
-    """Build Claude prompt injecting real indicator values."""
-    sma50_txt  = "${:.2f}".format(d["sma50"])  if d["sma50"]  else "N/A (< 50 bars)"
-    sma200_txt = "${:.2f}".format(d["sma200"]) if d["sma200"] else "N/A (< 200 bars)"
-    pcr_txt    = str(d["pcr"]) if d["pcr"] is not None else "unavailable"
-    above_below = lambda px, ref: "above" if ref and px > ref else "below" if ref else "N/A"
+def _tf_bias(df):
+    """3-signal majority vote → BULL / BEAR / NEUT."""
+    if df is None or len(df) < 5:
+        return "N/A"
+    c = df["Close"]
+    votes = 0
+    try:
+        if len(c) >= 20:
+            votes += 1 if float(c.iloc[-1]) > float(c.ewm(span=20, adjust=False).mean().iloc[-1]) else -1
+        if len(c) >= 15:
+            rsi_val = float(_calc_rsi(c).iloc[-1])
+            if not np.isnan(rsi_val):
+                votes += 1 if rsi_val > 50 else -1
+        if len(c) >= 26:
+            ml  = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+            mhv = float((ml - ml.ewm(span=9, adjust=False).mean()).iloc[-1])
+            if not np.isnan(mhv):
+                votes += 1 if mhv > 0 else -1
+    except Exception:
+        pass
+    return "BULL" if votes >= 2 else "BEAR" if votes <= -2 else "NEUT"
 
-    data_block = """
-LIVE MARKET DATA FOR {sym} (as of latest close):
-  Price:      ${px}  ({sign}{chg}%)
-  52w H/L:    ${high_52} / ${low_52}
-  Volume:     {vol:,}  ({vr:.1f}x 20-day avg)
 
-MOMENTUM (ARIA):
-  RSI-14:     {rsi}  ({'oversold' if d['rsi'] < 30 else 'overbought' if d['rsi'] > 70 else 'neutral'})
-  %B (BB):    {pctB:.3f}  ({'near lower band' if d['pctB'] < 0.2 else 'near upper band' if d['pctB'] > 0.8 else 'mid-range'})
-  Vol spike:  {vr:.1f}x average
+@st.cache_data(ttl=300)
+def fetch_tf_data(sym):
+    """Fetch 9 timeframes and return bias dict for ATLAS."""
+    specs = [
+        ("3min",  "2m",   "1d"),
+        ("5min",  "5m",   "5d"),
+        ("15min", "15m",  "5d"),
+        ("30min", "30m",  "1mo"),
+        ("1hr",   "60m",  "3mo"),
+        ("4hr",   "60m",  "6mo"),   # will resample
+        ("1day",  "1d",   "1y"),
+        ("1wk",   "1wk",  "5y"),
+        ("1mo",   "1mo",  "5y"),
+    ]
+    out = {}
+    for label, interval, period in specs:
+        try:
+            df = _fetch_df(sym, interval, period)
+            if label == "4hr" and df is not None:
+                df = (df.resample("4h")
+                        .agg({"Open": "first", "High": "max",
+                              "Low": "min", "Close": "last", "Volume": "sum"})
+                        .dropna())
+            out[label] = _tf_bias(df)
+        except Exception:
+            out[label] = "N/A"
+    return out
 
-TREND (NEXUS):
-  SMA20:      ${sma20}  (price {rel20})
-  SMA50:      {sma50}   (price {rel50})
-  SMA200:     {sma200}  (price {rel200})
-  EMA12:      ${ema12}  EMA26: ${ema26}  (cross: {'bullish' if d['ema12'] > d['ema26'] else 'bearish'})
-  VWAP:       ${vwap}   (price {relvwap})
 
-SENTIMENT (SIGMA):
-  Put/Call ratio (nearest expiry): {pcr}
-  52w position: {pos52:.1f}% of range
+def _build_prompt(sym, d, tf):
+    """Build Claude prompt. d=market data dict or None. tf=timeframe bias dict or None."""
+    ab = lambda px, ref: "above" if ref and px > ref else "below" if ref else "N/A"
 
-DIVERGENCE (DELTA):
-  MACD line:  {macd_line}  Signal: {macd_sig}  Hist: {macd_hist}
-  MACD hist direction: {'expanding' if abs(d['macd_hist']) > abs(d['macd_hist_prev']) else 'contracting'}
-  RSI divergence: {rsi_div}
-""".format(
-        sym=sym,
-        px=d["px"], sign="+" if d["chg"] >= 0 else "", chg=d["chg"],
-        high_52=d["high_52"], low_52=d["low_52"],
-        vol=d["volume"], vr=d["vol_ratio"],
-        rsi=d["rsi"], pctB=d["pctB"],
-        sma20=d["sma20"],
-        rel20=above_below(d["px"], d["sma20"]),
-        sma50=sma50_txt, rel50=above_below(d["px"], d["sma50"]),
-        sma200=sma200_txt, rel200=above_below(d["px"], d["sma200"]),
-        ema12=d["ema12"], ema26=d["ema26"],
-        vwap=d["vwap"], relvwap=above_below(d["px"], d["vwap"]),
-        pcr=pcr_txt,
-        pos52=((d["px"] - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100)
-              if d["high_52"] != d["low_52"] else 50,
-        macd_line=d["macd_line"], macd_sig=d["macd_sig"],
-        macd_hist=d["macd_hist"], macd_hist_prev=d["macd_hist_prev"],
-        rsi_div=d["rsi_div"],
-    )
+    if d:
+        sma50_txt  = "${:.2f}".format(d["sma50"])  if d["sma50"]  else "N/A"
+        sma200_txt = "${:.2f}".format(d["sma200"]) if d["sma200"] else "N/A"
+        pcr_txt    = str(d["pcr"]) if d["pcr"] is not None else "unavailable"
+        pos52 = ((d["px"] - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
+        data_block = (
+            "LIVE MARKET DATA FOR {sym}:\n"
+            "  Price: ${px} ({sign}{chg}%)  52wH/L: ${h52}/${l52}\n"
+            "  Volume: {vol:,} ({vr:.1f}x avg)\n\n"
+            "ARIA  — RSI-14: {rsi} ({rsi_lbl})  %B: {pctB:.3f}  Vol: {vr:.1f}x\n"
+            "NEXUS — SMA7: ${sma7} ({rel7})  SMA20: ${sma20} ({rel20})  SMA50: {sma50} ({rel50})\n"
+            "        SMA200: {sma200} ({rel200})  EMA12/26: ${ema12}/${ema26} ({ecross})\n"
+            "        VWAP: ${vwap} ({relvwap})\n"
+            "SIGMA — Put/Call: {pcr}  52w pos: {pos:.0f}%\n"
+            "DELTA — MACD line: {ml}  Signal: {ms}  Hist: {mh} ({mdir})  RSI div: {rdiv}\n"
+        ).format(
+            sym=sym, px=d["px"], sign="+" if d["chg"] >= 0 else "", chg=d["chg"],
+            h52=d["high_52"], l52=d["low_52"], vol=d["volume"], vr=d["vol_ratio"],
+            rsi=d["rsi"], rsi_lbl="oversold" if d["rsi"] < 30 else "overbought" if d["rsi"] > 70 else "neutral",
+            pctB=d["pctB"],
+            sma7=d["sma7"], rel7=ab(d["px"], d["sma7"]),
+            sma20=d["sma20"], rel20=ab(d["px"], d["sma20"]),
+            sma50=sma50_txt, rel50=ab(d["px"], d["sma50"]),
+            sma200=sma200_txt, rel200=ab(d["px"], d["sma200"]),
+            ema12=d["ema12"], ema26=d["ema26"],
+            ecross="bullish" if d["ema12"] > d["ema26"] else "bearish",
+            vwap=d["vwap"], relvwap=ab(d["px"], d["vwap"]),
+            pcr=pcr_txt, pos=pos52,
+            ml=d["macd_line"], ms=d["macd_sig"], mh=d["macd_hist"],
+            mdir="expanding" if abs(d["macd_hist"]) > abs(d["macd_hist_prev"]) else "contracting",
+            rdiv=d["rsi_div"],
+        )
+    else:
+        data_block = "NOTE: Live data unavailable. Use your knowledge of {} to estimate all analysis.\n".format(sym)
+
+    tf_block = "ATLAS — MULTI-TIMEFRAME BIAS:\n"
+    if tf:
+        tf_block += "  " + "  ".join("{}: {}".format(k, v) for k, v in tf.items()) + "\n"
+    else:
+        tf_block += "  Live TF data unavailable — estimate based on your knowledge.\n"
 
     return (
-        'Using ONLY the real market data below, analyze {sym}. '
-        'Reply with ONLY this JSON (no markdown, no backticks, just the object):\n'
+        "Analyze {sym}. Use the data below. "
+        "Reply with ONLY this JSON (no markdown, no backticks):\n"
         '{{"ARIA":{{"verdict":"CALL","confidence":72,'
-        '"analysis":"Two specific sentences about {sym} RSI/volume/Bollinger based on the data.",'
+        '"analysis":"Two specific sentences about {sym} momentum/RSI/volume.",'
         '"rsi":58,"vol":112,"mom":65}},'
         '"NEXUS":{{"verdict":"CALL","confidence":74,'
-        '"analysis":"Two specific sentences about {sym} moving averages/VWAP trend based on the data.",'
-        '"sma":68,"ema":72,"trend":70}},'
+        '"analysis":"Two specific sentences about {sym} SMA7/20/50/200 and trend.",'
+        '"sma7":62,"sma":68,"ema":72,"trend":70}},'
         '"SIGMA":{{"verdict":"PUT","confidence":69,'
-        '"analysis":"Two specific sentences about {sym} options/sentiment based on the data.",'
+        '"analysis":"Two specific sentences about {sym} options/sentiment.",'
         '"pcr":62,"ivr":45,"flow":55}},'
         '"DELTA":{{"verdict":"PUT","confidence":76,"rev":"NONE",'
-        '"analysis":"Two specific sentences about {sym} MACD/RSI divergence based on the data.",'
-        '"macd":65,"rsid":58,"cvd":60}}}}\n'
-        'Rules: base ALL verdicts and numbers on the data provided. Verdicts may differ across bots. '
-        'DELTA rev = BULLISH_REVERSAL, BEARISH_REVERSAL, or NONE based on actual divergence signals. '
-        'Confidence 55-94. Metric values 0-100 (vol up to 150). Be specific and cite actual numbers.\n\n'
-        '{data}'
-    ).format(sym=sym, data=data_block)
+        '"analysis":"Two specific sentences about {sym} MACD/RSI divergence.",'
+        '"macd":65,"rsid":58,"cvd":60}},'
+        '"ATLAS":{{"verdict":"CALL","confidence":78,'
+        '"analysis":"Two sentences summarizing {sym} multi-timeframe alignment.",'
+        '"short_tf":65,"mid_tf":70,"long_tf":80,"bull_count":6}}}}\n'
+        "Rules: verdicts may differ. DELTA rev = BULLISH_REVERSAL, BEARISH_REVERSAL, or NONE. "
+        "ATLAS bull_count = number of timeframes showing BULL (0-9). "
+        "Confidence 55-94. Metric values 0-100 (vol up to 150). Cite real numbers where available.\n\n"
+        "{data}\n{tf}"
+    ).format(sym=sym, data=data_block, tf=tf_block)
 
 
 def _extract_json(text):
@@ -252,7 +335,7 @@ def _parse_bot(bot_id, data):
         "ARIA":  [("RSI-14",       d.get("rsi",  55), 100),
                   ("Volume %",     d.get("vol",  55), 150),
                   ("Momentum",     d.get("mom",  55), 100)],
-        "NEXUS": [("50 SMA Score", d.get("sma",  55), 100),
+        "NEXUS": [("SMA 7/20 Score",d.get("sma7", 55), 100),
                   ("EMA Strength", d.get("ema",  55), 100),
                   ("Trend Align",  d.get("trend",55), 100)],
         "SIGMA": [("Put/Call",     d.get("pcr",  55), 100),
@@ -261,6 +344,9 @@ def _parse_bot(bot_id, data):
         "DELTA": [("MACD Div",     d.get("macd", 55), 100),
                   ("RSI Div",      d.get("rsid", 55), 100),
                   ("CVD Imbalance",d.get("cvd",  55), 100)],
+        "ATLAS": [("Short TF",     d.get("short_tf", 55), 100),
+                  ("Mid TF",       d.get("mid_tf",   55), 100),
+                  ("Long TF",      d.get("long_tf",  55), 100)],
     }
     metrics = [{"label": lbl,
                 "value": min(mx, max(0, float(v or 55))),
@@ -270,12 +356,12 @@ def _parse_bot(bot_id, data):
             "analysis": analysis, "metrics": metrics, "reversal": reversal}
 
 
-def run_swarm(sym, api_key, market_data):
+def run_swarm(sym, api_key, market_data, tf_data):
     client = anthropic.Anthropic(api_key=api_key)
-    prompt = _build_prompt(sym, market_data)
+    prompt = _build_prompt(sym, market_data, tf_data)
     msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=1400,
         system="You are a stock analysis API. Output ONLY a raw JSON object. No markdown. No explanation. Just JSON.",
         messages=[{"role": "user", "content": prompt}],
     )
@@ -298,7 +384,7 @@ with st.sidebar:
       -webkit-background-clip:text;-webkit-text-fill-color:transparent;
       margin-bottom:4px">TRADESWARM</div>
     <div style="color:#334;font-size:9px;letter-spacing:2px;margin-bottom:20px">
-      4-BOT PUT/CALL ANALYZER
+      5-BOT PUT/CALL ANALYZER
     </div>""", unsafe_allow_html=True)
 
     st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:4px">ANTHROPIC KEY</div>', unsafe_allow_html=True)
@@ -346,7 +432,7 @@ st.markdown("""
     TRADESWARM
   </div>
   <div style="color:#1e1e30;font-size:9px;letter-spacing:3px">
-    4-BOT PUT/CALL · LIVE DATA · CHART · REVERSAL DETECTION
+    5-BOT PUT/CALL · LIVE DATA · MULTI-TIMEFRAME · REVERSAL DETECTION
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -368,8 +454,9 @@ if not ticker:
     </div>""", unsafe_allow_html=True)
     st.stop()
 
-# ── Live price bar ─────────────────────────────────────────────────────────────
+# ── Live data ──────────────────────────────────────────────────────────────────
 md = fetch_market_data(ticker)
+tf = fetch_tf_data(ticker)
 if md:
     up = md["chg"] >= 0
     cc = "#00ff88" if up else "#ff4466"
@@ -413,7 +500,7 @@ if md:
         pos=pos52,
     ), unsafe_allow_html=True)
 else:
-    st.warning("Could not fetch market data for {}. Check the ticker symbol.".format(ticker))
+    st.info("Live price data unavailable for {} — analysis will run using AI estimation.".format(ticker))
 
 # ── TradingView chart ──────────────────────────────────────────────────────────
 tv_src = (
@@ -439,15 +526,13 @@ st.markdown("""
 
 # ── Run analysis ───────────────────────────────────────────────────────────────
 if run_btn:
-    if not md:
-        st.error("Cannot run analysis — market data unavailable for {}.".format(ticker))
-        st.stop()
-    with st.spinner("Fetching live data and deploying swarm on {}...".format(ticker)):
+    with st.spinner("Deploying 5-bot swarm on {}...".format(ticker)):
         try:
-            results, raw = run_swarm(ticker, st.session_state["ant_key"], md)
+            results, raw = run_swarm(ticker, st.session_state["ant_key"], md, tf)
             st.session_state["swarm_results"] = results
             st.session_state["swarm_ticker"]  = ticker
             st.session_state["swarm_raw"]     = raw
+            st.session_state["swarm_tf"]      = tf
             st.session_state.pop("swarm_error", None)
         except Exception as e:
             st.session_state["swarm_error"]   = str(e)
@@ -466,70 +551,106 @@ results = st.session_state.get("swarm_results")
 if not results:
     st.stop()
 
-# Bot cards
-col_l, col_r = st.columns(2)
-for i, (bot, r) in enumerate(zip(BOTS, results)):
-    col = col_l if i % 2 == 0 else col_r
-    bc  = bot["color"]
-    vc  = "#00ff88" if r["verdict"] == "CALL" else "#ff4466"
-
+def _bot_card_html(bot, r):
+    bc = bot["color"]
+    vc = "#00ff88" if r["verdict"] == "CALL" else "#ff4466"
     metrics_html = "".join(
         '<div style="margin-bottom:7px">'
         '<div style="display:flex;justify-content:space-between;font-size:10px;color:#556">'
         '<span>{lbl}</span><span style="color:{bc}">{val:.0f}</span></div>'
         '<div style="height:4px;background:#0f0f20;border-radius:3px;overflow:hidden;margin-top:2px">'
-        '<div style="width:{pct:.0f}%;height:100%;'
-        'background:linear-gradient(90deg,{bc}55,{bc});border-radius:3px"></div>'
-        '</div></div>'.format(
-            lbl=m["label"], val=m["value"], bc=bc,
-            pct=min(100, m["value"] / m["max"] * 100))
+        '<div style="width:{pct:.0f}%;height:100%;background:linear-gradient(90deg,{bc}55,{bc});border-radius:3px"></div>'
+        '</div></div>'.format(lbl=m["label"], val=m["value"], bc=bc, pct=min(100, m["value"] / m["max"] * 100))
         for m in r["metrics"]
     )
-
     rev_html = ""
     if r.get("reversal") and r["reversal"] != "NONE":
         rc = "#00ff88" if r["reversal"] == "BULLISH_REVERSAL" else "#ff4466"
         rl = "⬆ BULLISH REVERSAL" if r["reversal"] == "BULLISH_REVERSAL" else "⬇ BEARISH REVERSAL"
-        rev_html = ('<div style="margin-top:8px;padding:4px 9px;background:{c}10;'
-                    'border:1px solid {c}40;border-radius:6px;color:{c};'
-                    'font-size:9px;font-weight:800">{l}</div>').format(c=rc, l=rl)
-
+        rev_html = '<div style="margin-top:8px;padding:4px 9px;background:{c}10;border:1px solid {c}40;border-radius:6px;color:{c};font-size:9px;font-weight:800">{l}</div>'.format(c=rc, l=rl)
     tags_html = "".join(
-        '<span style="padding:2px 5px;border-radius:3px;font-size:8px;margin-right:3px;'
-        'background:{bc}0c;border:1px solid {bc}18;color:{bc}55">{t}</span>'.format(bc=bc, t=t)
+        '<span style="padding:2px 5px;border-radius:3px;font-size:8px;margin-right:3px;background:{bc}0c;border:1px solid {bc}18;color:{bc}55">{t}</span>'.format(bc=bc, t=t)
         for t in bot["tags"]
     )
-
-    col.markdown("""
-    <div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);
-      border:1px solid {bc}40;border-radius:12px;padding:16px;margin-bottom:12px">
+    return """
+    <div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);border:1px solid {bc}40;border-radius:12px;padding:16px;margin-bottom:12px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-        <div style="width:38px;height:38px;border-radius:9px;flex-shrink:0;
-          background:{bc}18;border:1px solid {bc}30;display:flex;align-items:center;
-          justify-content:center;font-size:18px;color:{bc}">{icon}</div>
+        <div style="width:38px;height:38px;border-radius:9px;flex-shrink:0;background:{bc}18;border:1px solid {bc}30;display:flex;align-items:center;justify-content:center;font-size:18px;color:{bc}">{icon}</div>
         <div style="flex:1">
           <div style="color:{bc};font-weight:800;font-size:13px;letter-spacing:2px">{id}</div>
           <div style="color:{bc}66;font-size:8px">{role}</div>
         </div>
-        <div style="padding:2px 10px;border-radius:20px;background:{vc}12;
-          border:1px solid {vc}44;color:{vc};font-weight:800;font-size:11px;
-          letter-spacing:2px">{verdict}</div>
+        <div style="padding:2px 10px;border-radius:20px;background:{vc}12;border:1px solid {vc}44;color:{vc};font-weight:800;font-size:11px;letter-spacing:2px">{verdict}</div>
       </div>
       <div style="margin-bottom:8px">{tags}</div>
-      <div style="background:#05050f;border-radius:7px;padding:11px;min-height:54px;
-        border:1px solid #141428;font-size:11px;line-height:1.8;color:#8899b0;
-        margin-bottom:10px">{analysis}</div>
+      <div style="background:#05050f;border-radius:7px;padding:11px;min-height:54px;border:1px solid #141428;font-size:11px;line-height:1.8;color:#8899b0;margin-bottom:10px">{analysis}</div>
+      {metrics}{rev}
+      <div style="display:flex;justify-content:space-between;margin-top:8px">
+        <span style="color:#222;font-size:9px">CONFIDENCE</span>
+        <span style="color:{bc};font-size:11px;font-weight:800">{conf}%</span>
+      </div>
+    </div>""".format(bc=bc, icon=bot["icon"], id=bot["id"], role=bot["role"],
+                     vc=vc, verdict=r["verdict"], tags=tags_html,
+                     analysis=r["analysis"], metrics=metrics_html, rev=rev_html, conf=r["confidence"])
+
+# Bot cards — first 4 in 2-column grid
+col_l, col_r = st.columns(2)
+for i in range(4):
+    col = col_l if i % 2 == 0 else col_r
+    col.markdown(_bot_card_html(BOTS[i], results[i]), unsafe_allow_html=True)
+
+# ATLAS card — full width with timeframe grid
+if len(results) >= 5:
+    atlas_r  = results[4]
+    atlas_bc = "#ffd700"
+    atlas_vc = "#00ff88" if atlas_r["verdict"] == "CALL" else "#ff4466"
+    saved_tf = st.session_state.get("swarm_tf") or {}
+    tf_order = ["3min","5min","15min","30min","1hr","4hr","1day","1wk","1mo"]
+    tf_labels = {"3min":"3MIN","5min":"5MIN","15min":"15M","30min":"30M","1hr":"1HR","4hr":"4HR","1day":"1DAY","1wk":"1WK","1mo":"1MO"}
+    def tf_color(b):
+        return "#00ff88" if b == "BULL" else "#ff4466" if b == "BEAR" else "#667" if b == "NEUT" else "#333"
+    tf_cells = "".join(
+        '<div style="padding:5px 4px;border-radius:5px;background:{bc}14;border:1px solid {bc}30;text-align:center">'
+        '<div style="color:#556;font-size:8px">{lbl}</div>'
+        '<div style="color:{bc};font-size:10px;font-weight:800">{v}</div>'
+        '</div>'.format(lbl=tf_labels.get(k, k), v=saved_tf.get(k, "N/A"), bc=tf_color(saved_tf.get(k, "N/A")))
+        for k in tf_order
+    )
+    atlas_metrics_html = "".join(
+        '<div style="margin-bottom:7px">'
+        '<div style="display:flex;justify-content:space-between;font-size:10px;color:#556">'
+        '<span>{lbl}</span><span style="color:{bc}">{val:.0f}</span></div>'
+        '<div style="height:4px;background:#0f0f20;border-radius:3px;overflow:hidden;margin-top:2px">'
+        '<div style="width:{pct:.0f}%;height:100%;background:linear-gradient(90deg,{bc}55,{bc});border-radius:3px"></div>'
+        '</div></div>'.format(lbl=m["label"], val=m["value"], bc=atlas_bc, pct=min(100, m["value"] / m["max"] * 100))
+        for m in atlas_r["metrics"]
+    )
+    atlas_tags = "".join(
+        '<span style="padding:2px 5px;border-radius:3px;font-size:8px;margin-right:3px;background:{bc}0c;border:1px solid {bc}18;color:{bc}55">{t}</span>'.format(bc=atlas_bc, t=t)
+        for t in BOTS[4]["tags"]
+    )
+    st.markdown("""
+    <div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);border:1px solid {bc}40;border-radius:12px;padding:16px;margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <div style="width:38px;height:38px;border-radius:9px;flex-shrink:0;background:{bc}18;border:1px solid {bc}30;display:flex;align-items:center;justify-content:center;font-size:18px;color:{bc}">◎</div>
+        <div style="flex:1">
+          <div style="color:{bc};font-weight:800;font-size:13px;letter-spacing:2px">ATLAS</div>
+          <div style="color:{bc}66;font-size:8px">MULTI-TIMEFRAME</div>
+        </div>
+        <div style="padding:2px 10px;border-radius:20px;background:{vc}12;border:1px solid {vc}44;color:{vc};font-weight:800;font-size:11px;letter-spacing:2px">{verdict}</div>
+      </div>
+      <div style="margin-bottom:8px">{tags}</div>
+      <div style="display:grid;grid-template-columns:repeat(9,1fr);gap:5px;margin-bottom:10px">{tf_cells}</div>
+      <div style="background:#05050f;border-radius:7px;padding:11px;border:1px solid #141428;font-size:11px;line-height:1.8;color:#8899b0;margin-bottom:10px">{analysis}</div>
       {metrics}
-      {rev}
       <div style="display:flex;justify-content:space-between;margin-top:8px">
         <span style="color:#222;font-size:9px">CONFIDENCE</span>
         <span style="color:{bc};font-size:11px;font-weight:800">{conf}%</span>
       </div>
     </div>""".format(
-        bc=bc, icon=bot["icon"], id=bot["id"], role=bot["role"],
-        vc=vc, verdict=r["verdict"], tags=tags_html,
-        analysis=r["analysis"], metrics=metrics_html,
-        rev=rev_html, conf=r["confidence"],
+        bc=atlas_bc, vc=atlas_vc, verdict=atlas_r["verdict"],
+        tags=atlas_tags, tf_cells=tf_cells,
+        analysis=atlas_r["analysis"], metrics=atlas_metrics_html, conf=atlas_r["confidence"]
     ), unsafe_allow_html=True)
 
 # Verdict panel
@@ -568,9 +689,9 @@ st.markdown("""
   box-shadow:0 0 60px {fc}18;position:relative;overflow:hidden;margin-top:4px">
   <div style="position:absolute;inset:0;pointer-events:none;
     background:radial-gradient(ellipse at 50% 0%,{fc}08,transparent 65%)"></div>
-  <div style="color:#333;font-size:10px;letter-spacing:3px;margin-bottom:5px">▸ 4-BOT CONSENSUS ◂</div>
+  <div style="color:#333;font-size:10px;letter-spacing:3px;margin-bottom:5px">▸ 5-BOT CONSENSUS ◂</div>
   <div style="color:#444;font-size:10px;margin-bottom:14px">
-    {ticker} &nbsp;·&nbsp; {calls}/4 CALL &nbsp;·&nbsp; {puts}/4 PUT
+    {ticker} &nbsp;·&nbsp; {calls}/5 CALL &nbsp;·&nbsp; {puts}/5 PUT
   </div>
   <div style="display:flex;justify-content:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
     {votes}
