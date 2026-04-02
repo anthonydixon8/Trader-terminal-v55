@@ -297,9 +297,21 @@ def _build_prompt(sym, d, tf):
         '"ATLAS":{{"verdict":"CALL","confidence":78,'
         '"analysis":"Two sentences summarizing {sym} multi-timeframe alignment.",'
         '"short_tf":65,"mid_tf":70,"long_tf":80,"bull_count":6}}}}\n'
-        "Rules: verdicts may differ. DELTA rev = BULLISH_REVERSAL, BEARISH_REVERSAL, or NONE. "
-        "ATLAS bull_count = number of timeframes showing BULL (0-9). "
-        "Confidence 55-94. Metric values 0-100 (vol up to 150). Cite real numbers where available.\n\n"
+        "STRICT INDEPENDENT RULES — each bot uses ONLY its own indicators, not the others:\n"
+        "• ARIA: RSI>70 → lean PUT (overbought). RSI<30 → lean CALL (oversold). "
+        "%B>0.85 → PUT. %B<0.15 → CALL. vol_ratio>2 amplifies the RSI signal.\n"
+        "• NEXUS: px<sma7 AND px<sma20 → lean PUT. "
+        "px>sma7 AND px>sma20 AND (px>sma50 or sma50 unavailable) → lean CALL. "
+        "ema12<ema26 (bearish EMA cross) → PUT lean. px below VWAP → PUT lean.\n"
+        "• SIGMA: pcr>1.2 → lean PUT (heavy puts). pcr<0.7 → lean CALL (bullish flow). "
+        "52w pos<20% → CALL lean (deep value). 52w pos>80% → PUT lean (extended).\n"
+        "• DELTA: macd_hist<0 AND |hist|>|hist_prev| (neg expanding) → PUT. "
+        "rsi_div=bullish → CALL lean. macd_hist>0 AND |hist|>|hist_prev| (pos expanding) → CALL.\n"
+        "• ATLAS: bull_count>=6 → CALL. bull_count<=3 → PUT. Must match the TF data exactly.\n"
+        "• BOTS MUST DISAGREE when signals conflict — NEVER default all to the same verdict.\n"
+        "• DELTA rev = BULLISH_REVERSAL, BEARISH_REVERSAL, or NONE.\n"
+        "• ATLAS bull_count = exact count of timeframes showing BULL (0-9).\n"
+        "• Confidence 55-94. Metric scores 0-100 (vol up to 150). Use EXACT data numbers.\n\n"
         "{data}\n{tf}"
     ).format(sym=sym, data=data_block, tf=tf_block)
 
@@ -385,6 +397,125 @@ def run_swarm(sym, api_key, provider, market_data, tf_data):
     return [_parse_bot(b["id"], data) for b in BOTS], raw
 
 
+# ── Agent definitions ─────────────────────────────────────────────────────────
+BULL_AGENTS = [
+    {"id": "ZEUS",     "role": "FUNDAMENTALS",    "color": "#ffd700", "icon": "⚡"},
+    {"id": "HERMES",   "role": "MOMENTUM",         "color": "#00ff88", "icon": "🜲"},
+    {"id": "APOLLO",   "role": "NEWS/CATALYSTS",   "color": "#00cfff", "icon": "☀"},
+    {"id": "ARES",     "role": "OPTIONS FLOW",     "color": "#ff9500", "icon": "⚔"},
+    {"id": "POSEIDON", "role": "MACRO/SECTOR",     "color": "#40e0d0", "icon": "🜄"},
+]
+BEAR_AGENTS = [
+    {"id": "KRONOS",  "role": "VALUATION/RISK",   "color": "#ff4466", "icon": "⏳"},
+    {"id": "HADES",   "role": "TECH BREAKDOWN",   "color": "#c084fc", "icon": "☽"},
+    {"id": "NEMESIS", "role": "HEADWINDS",         "color": "#ff6b35", "icon": "⚖"},
+]
+
+
+def _build_agent_prompt(sym, d, tf, bot_results):
+    bot_summary = " | ".join(
+        "{}: {} {}%".format(BOTS[i]["id"], bot_results[i]["verdict"], bot_results[i]["confidence"])
+        for i in range(len(bot_results))
+    )
+    px = d["px"] if d else "unknown"
+    if d:
+        pos52 = ((d["px"] - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
+        data_s = (
+            "Price ${px} ({sign}{chg}%) | RSI {rsi} | MACD hist {mh} | "
+            "EMA cross {ec} | SMA200 {s200} | PCR {pcr} | 52w pos {pos:.0f}% | "
+            "Vol {vr:.1f}x avg"
+        ).format(
+            px=d["px"], sign="+" if d["chg"] >= 0 else "", chg=d["chg"],
+            rsi=d["rsi"], mh=d["macd_hist"],
+            ec="bullish" if d["ema12"] > d["ema26"] else "bearish",
+            s200=("above ${:.2f}".format(d["sma200"]) if d.get("sma200") and d["px"] > d["sma200"]
+                  else "below ${:.2f}".format(d["sma200"]) if d.get("sma200") else "N/A"),
+            pcr=d["pcr"] if d["pcr"] is not None else "N/A",
+            pos=pos52, vr=d["vol_ratio"],
+        )
+    else:
+        data_s = "Live data unavailable — use your knowledge of {}.".format(sym)
+
+    tf_s = ""
+    if tf:
+        bull_c = sum(1 for v in tf.values() if v == "BULL")
+        bear_c = sum(1 for v in tf.values() if v == "BEAR")
+        tf_s = "{} BULL / {} BEAR across 9 timeframes".format(bull_c, bear_c)
+    else:
+        tf_s = "TF data unavailable"
+
+    return (
+        "8 AI agents are debating whether to buy a CALL or PUT option on {sym}.\n"
+        "CALL = expecting price to go UP. PUT = expecting price to go DOWN.\n\n"
+        "Market snapshot: {data}\n"
+        "Timeframes: {tf}\n"
+        "Technical bots voted: {bots}\n\n"
+        "BULL agents (must argue for CALL/price UP): "
+        "ZEUS (earnings/fundamentals), HERMES (price momentum), "
+        "APOLLO (news/upcoming catalysts), ARES (unusual options activity/dark pool), "
+        "POSEIDON (macro tailwinds/sector rotation).\n"
+        "BEAR agents (must argue for PUT/price DOWN): "
+        "KRONOS (overvaluation/risk metrics), "
+        "HADES (bearish technicals/chart breakdown), "
+        "NEMESIS (macro headwinds/competitive threats).\n\n"
+        "Rules: Each agent argues their assigned side with 2 specific sentences. "
+        "Set price_target relative to current price ${px}. "
+        "bull_prob + bear_prob = 100. consensus_target = probability-weighted average. "
+        "final_verdict = CALL if bull_prob>50, else PUT.\n\n"
+        "Reply with ONLY this JSON (no markdown, no backticks):\n"
+        '{{"agents":{{'
+        '"ZEUS":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"HERMES":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"APOLLO":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"ARES":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"POSEIDON":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"KRONOS":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"HADES":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"NEMESIS":{{"argument":"...","price_target":0.0,"confidence":70}}'
+        '}},'
+        '"debate":"2 sentences summarizing which side made the stronger case and why.",'
+        '"bull_prob":60,"bear_prob":40,'
+        '"consensus_target":0.0,'
+        '"verdict":"CALL"}}'
+    ).format(sym=sym, data=data_s, tf=tf_s, bots=bot_summary, px=px)
+
+
+def run_agents(sym, api_key, provider, market_data, tf_data, bot_results):
+    prompt = _build_agent_prompt(sym, market_data, tf_data, bot_results)
+    system = "You are a multi-agent financial debate API. Output ONLY raw JSON. No markdown, no explanation, no backticks."
+
+    if provider == "groq":
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user",   "content": prompt}],
+                "temperature": 0.4,
+                "max_tokens": 2200,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+    else:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2200,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(c.text for c in msg.content if hasattr(c, "text")).strip()
+
+    data = _extract_json(raw)
+    if data is None:
+        raise ValueError("Could not parse agent JSON: " + raw[:300])
+    return data, raw
+
+
 # ── Session state ──────────────────────────────────────────────────────────────
 if "ant_key"  not in st.session_state:
     st.session_state["ant_key"]  = os.getenv("ANTHROPIC_API_KEY", "")
@@ -392,6 +523,10 @@ if "groq_key" not in st.session_state:
     st.session_state["groq_key"] = os.getenv("GROQ_API_KEY", "")
 if "provider" not in st.session_state:
     st.session_state["provider"] = "groq" if os.getenv("GROQ_API_KEY") else "anthropic"
+if "agent_results" not in st.session_state:
+    st.session_state["agent_results"] = None
+if "agent_raw" not in st.session_state:
+    st.session_state["agent_raw"] = None
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -588,6 +723,19 @@ if run_btn:
             st.session_state["swarm_error"]   = str(e)
             st.session_state["swarm_ticker"]  = ticker
             st.session_state.pop("swarm_results", None)
+    if st.session_state.get("swarm_results"):
+        with st.spinner("⚡ Launching 8-agent debate on {}...".format(ticker)):
+            try:
+                agent_data, agent_raw = run_agents(
+                    ticker, _active_key, st.session_state["provider"],
+                    md, tf, st.session_state["swarm_results"]
+                )
+                st.session_state["agent_results"] = agent_data
+                st.session_state["agent_raw"]     = agent_raw
+                st.session_state.pop("agent_error", None)
+            except Exception as e:
+                st.session_state["agent_error"]   = str(e)
+                st.session_state["agent_results"] = None
 
 # ── Display results ────────────────────────────────────────────────────────────
 if st.session_state.get("swarm_ticker") != ticker:
@@ -762,5 +910,164 @@ st.markdown("""
     avgc=avg_c, rev_badge=rev_badge,
 ), unsafe_allow_html=True)
 
-with st.expander("🔍 Raw API response"):
+# ── 8-Agent Debate ─────────────────────────────────────────────────────────────
+st.markdown("""
+<div style="text-align:center;padding:20px 0 10px">
+  <div style="color:#1e1e30;font-size:9px;letter-spacing:4px;margin-bottom:4px">▸ PROBABILITY-WEIGHTED DEBATE ◂</div>
+  <div style="font-size:20px;font-weight:900;letter-spacing:6px;
+    background:linear-gradient(90deg,#ffd700,#00ff88,#ff4466);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent">
+    ⚡ 8-AGENT DEBATE
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+if st.session_state.get("agent_error"):
+    st.warning("Agent debate error: " + st.session_state["agent_error"])
+
+agent_data = st.session_state.get("agent_results")
+if agent_data:
+    agents_raw = agent_data.get("agents", {})
+
+    def _agent_card(agent_def, side):
+        a = agents_raw.get(agent_def["id"], {})
+        bc = agent_def["color"]
+        sc = "#00ff88" if side == "BULL" else "#ff4466"
+        side_lbl = "▲ BULL" if side == "BULL" else "▼ BEAR"
+        arg = str(a.get("argument", "Analysis in progress.")).strip()
+        pt  = a.get("price_target", 0)
+        conf = min(94, max(55, int(a.get("confidence", 68))))
+        pt_html = ('<div style="margin-top:6px;color:{bc};font-size:11px;font-weight:800">'
+                   'TARGET: ${:.2f}</div>'.format(pt, bc=bc)) if pt else ""
+        return """
+<div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);
+  border:1px solid {bc}40;border-radius:12px;padding:14px;margin-bottom:10px">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px">
+    <div style="width:32px;height:32px;border-radius:8px;background:{bc}18;border:1px solid {bc}30;
+      display:flex;align-items:center;justify-content:center;font-size:16px;color:{bc};flex-shrink:0">{icon}</div>
+    <div style="flex:1">
+      <div style="color:{bc};font-weight:800;font-size:12px;letter-spacing:2px">{id}</div>
+      <div style="color:{bc}66;font-size:8px">{role}</div>
+    </div>
+    <div style="padding:2px 8px;border-radius:12px;background:{sc}12;border:1px solid {sc}44;
+      color:{sc};font-size:9px;font-weight:800">{side}</div>
+  </div>
+  <div style="background:#05050f;border-radius:7px;padding:10px;border:1px solid #141428;
+    font-size:10px;line-height:1.7;color:#8899b0">{arg}</div>
+  {pt}
+  <div style="display:flex;justify-content:space-between;margin-top:7px">
+    <span style="color:#222;font-size:8px">CONFIDENCE</span>
+    <span style="color:{bc};font-size:10px;font-weight:800">{conf}%</span>
+  </div>
+</div>""".format(bc=bc, sc=sc, icon=agent_def["icon"], id=agent_def["id"],
+                 role=agent_def["role"], side=side_lbl, arg=arg, pt=pt_html, conf=conf)
+
+    # Bull agents header
+    st.markdown('<div style="color:#ffd70077;font-size:10px;font-weight:800;letter-spacing:3px;margin:8px 0 4px">▲ BULL CASE — 5 AGENTS</div>', unsafe_allow_html=True)
+    bc1, bc2, bc3 = st.columns(3)
+    bull_cols = [bc1, bc2, bc3, bc1, bc2]
+    for i, ag in enumerate(BULL_AGENTS):
+        bull_cols[i].markdown(_agent_card(ag, "BULL"), unsafe_allow_html=True)
+
+    # Bear agents header
+    st.markdown('<div style="color:#ff446677;font-size:10px;font-weight:800;letter-spacing:3px;margin:8px 0 4px">▼ BEAR CASE — 3 AGENTS</div>', unsafe_allow_html=True)
+    br1, br2, br3 = st.columns(3)
+    bear_cols = [br1, br2, br3]
+    for i, ag in enumerate(BEAR_AGENTS):
+        bear_cols[i].markdown(_agent_card(ag, "BEAR"), unsafe_allow_html=True)
+
+    # Debate summary + probability
+    debate_txt  = str(agent_data.get("debate", "Debate complete."))
+    bull_prob   = int(agent_data.get("bull_prob", 50))
+    bear_prob   = int(agent_data.get("bear_prob", 50))
+    consensus_t = float(agent_data.get("consensus_target", 0) or 0)
+    ag_verdict  = "CALL" if str(agent_data.get("verdict", "CALL")).upper() == "CALL" else "PUT"
+    avc         = "#00ff88" if ag_verdict == "CALL" else "#ff4466"
+
+    # Individual agent targets
+    bull_targets = [float(agents_raw.get(a["id"], {}).get("price_target", 0) or 0) for a in BULL_AGENTS]
+    bear_targets = [float(agents_raw.get(a["id"], {}).get("price_target", 0) or 0) for a in BEAR_AGENTS]
+    bull_avg = round(sum(t for t in bull_targets if t > 0) / max(1, sum(1 for t in bull_targets if t > 0)), 2)
+    bear_avg = round(sum(t for t in bear_targets if t > 0) / max(1, sum(1 for t in bear_targets if t > 0)), 2)
+
+    st.markdown("""
+<div style="background:linear-gradient(145deg,#08081a,#0d0d22);border:1px solid #1c1c30;
+  border-radius:12px;padding:18px;margin:10px 0">
+  <div style="color:#334;font-size:9px;letter-spacing:2px;margin-bottom:8px">▸ DEBATE OUTCOME</div>
+  <div style="color:#8899b0;font-size:11px;line-height:1.8;margin-bottom:14px">{debate}</div>
+  <div style="display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap">
+    <div style="flex:1;min-width:120px;text-align:center;padding:10px;
+      background:#00ff8808;border:1px solid #00ff8820;border-radius:8px">
+      <div style="color:#556;font-size:8px;margin-bottom:3px">BULL TARGET (avg)</div>
+      <div style="color:#00ff88;font-size:18px;font-weight:800;font-family:'Courier New',monospace">
+        ${bull_avg}</div>
+    </div>
+    <div style="flex:1;min-width:120px;text-align:center;padding:10px;
+      background:#ffffff06;border:1px solid #ffffff10;border-radius:8px">
+      <div style="color:#556;font-size:8px;margin-bottom:3px">CONSENSUS TARGET</div>
+      <div style="color:#e0e0e0;font-size:18px;font-weight:800;font-family:'Courier New',monospace">
+        ${consensus}</div>
+    </div>
+    <div style="flex:1;min-width:120px;text-align:center;padding:10px;
+      background:#ff440808;border:1px solid #ff440820;border-radius:8px">
+      <div style="color:#556;font-size:8px;margin-bottom:3px">BEAR TARGET (avg)</div>
+      <div style="color:#ff4466;font-size:18px;font-weight:800;font-family:'Courier New',monospace">
+        ${bear_avg}</div>
+    </div>
+  </div>
+  <div style="color:#334;font-size:8px;margin-bottom:5px">PROBABILITY SPLIT</div>
+  <div style="height:18px;border-radius:9px;overflow:hidden;background:#0f0f20;display:flex">
+    <div style="width:{bp}%;background:linear-gradient(90deg,#00ff8844,#00ff88);
+      display:flex;align-items:center;justify-content:center;
+      font-size:9px;font-weight:800;color:#050510">{bp}% BULL</div>
+    <div style="width:{brp}%;background:linear-gradient(90deg,#ff446644,#ff4466);
+      display:flex;align-items:center;justify-content:center;
+      font-size:9px;font-weight:800;color:#050510">{brp}% BEAR</div>
+  </div>
+</div>""".format(
+        debate=debate_txt, bull_avg=bull_avg, consensus=round(consensus_t, 2), bear_avg=bear_avg,
+        bp=bull_prob, brp=bear_prob,
+    ), unsafe_allow_html=True)
+
+    # Combined verdict (bots + agents)
+    bot_calls = sum(1 for r in results if r["verdict"] == "CALL")
+    bot_puts  = len(results) - bot_calls
+    # Weight: bots 40%, agents 60%
+    bot_call_score   = bot_calls / len(results) * 40
+    agent_call_score = bull_prob / 100 * 60
+    combined_call    = bot_call_score + agent_call_score
+    combined_verdict = "CALL" if combined_call >= 50 else "PUT"
+    cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
+    combined_conf = round((avg_c * 0.4) + (max(bull_prob, bear_prob) * 0.6))
+
+    st.markdown("""
+<div style="background:linear-gradient(145deg,#07071a,#0c0c22);
+  border:2px solid {cvc};border-radius:14px;padding:26px;text-align:center;
+  box-shadow:0 0 60px {cvc}18;position:relative;overflow:hidden;margin-top:8px">
+  <div style="position:absolute;inset:0;pointer-events:none;
+    background:radial-gradient(ellipse at 50% 0%,{cvc}08,transparent 65%)"></div>
+  <div style="color:#333;font-size:10px;letter-spacing:3px;margin-bottom:5px">
+    ▸ COMBINED VERDICT — BOTS + AGENTS ◂</div>
+  <div style="color:#444;font-size:10px;margin-bottom:10px">
+    {ticker} &nbsp;·&nbsp; Bots {bot_calls}/5 CALL &nbsp;·&nbsp; Agents {bp}% BULL
+    &nbsp;·&nbsp; Weighted 40/60
+  </div>
+  <div style="font-size:64px;font-weight:900;color:{cvc};letter-spacing:12px;
+    line-height:1;text-shadow:0 0 40px {cvc}66;margin-bottom:8px">{cv}</div>
+  <div style="color:{cvc}77;font-size:12px;letter-spacing:4px;margin-bottom:14px">
+    COMBINED SIGNAL &nbsp;·&nbsp; {conf}% CONFIDENCE
+  </div>
+  <div style="display:inline-block;padding:5px 16px;background:#ffffff06;
+    border:1px solid #181830;border-radius:7px;color:#334;font-size:10px">
+    ⚠ AI analysis only — not financial advice
+  </div>
+</div>""".format(
+        cvc=cvc, ticker=ticker, bot_calls=bot_calls, bp=bull_prob,
+        cv=combined_verdict, conf=combined_conf,
+    ), unsafe_allow_html=True)
+
+with st.expander("🔍 Raw bot response"):
     st.code(st.session_state.get("swarm_raw", ""), language="json")
+
+with st.expander("🔍 Raw agent debate response"):
+    st.code(st.session_state.get("agent_raw", ""), language="json")
