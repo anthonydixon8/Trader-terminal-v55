@@ -398,21 +398,118 @@ def run_swarm(sym, api_key, provider, market_data, tf_data):
 
 
 # ── Agent definitions ─────────────────────────────────────────────────────────
+_BULL_AGENT_ROLES = {
+    "stock":     ["FUNDAMENTALS",    "MOMENTUM", "CATALYSTS",   "OPTIONS FLOW", "MACRO/SECTOR"],
+    "commodity": ["SUPPLY/DEMAND",   "MOMENTUM", "MACRO DRIVER","OPTIONS FLOW", "MACRO TAILWIND"],
+    "etf":       ["FUND COMPOSITION","MOMENTUM", "MACRO EVENT", "OPTIONS FLOW", "SECTOR ROTATION"],
+    "index":     ["MARKET BREADTH",  "MOMENTUM", "MACRO CATALYST","INDEX FLOW",  "GLOBAL MACRO"],
+}
+_BEAR_AGENT_ROLES = {
+    "stock":     ["VALUATION/RISK", "TECH BREAKDOWN", "HEADWINDS"],
+    "commodity": ["OVERBOUGHT RISK","TECH BREAKDOWN",  "MACRO HEADWIND"],
+    "etf":       ["OVEREXTENSION",  "TECH BREAKDOWN",  "RISK-OFF"],
+    "index":     ["VALUATION RISK", "TECH BREAKDOWN",  "MACRO RISK"],
+}
 BULL_AGENTS = [
-    {"id": "ZEUS",     "role": "FUNDAMENTALS",    "color": "#ffd700", "icon": "⚡"},
-    {"id": "HERMES",   "role": "MOMENTUM",         "color": "#00ff88", "icon": "🜲"},
-    {"id": "APOLLO",   "role": "NEWS/CATALYSTS",   "color": "#00cfff", "icon": "☀"},
-    {"id": "ARES",     "role": "OPTIONS FLOW",     "color": "#ff9500", "icon": "⚔"},
-    {"id": "POSEIDON", "role": "MACRO/SECTOR",     "color": "#40e0d0", "icon": "🜄"},
+    {"id": "ZEUS",     "color": "#ffd700", "icon": "⚡"},
+    {"id": "HERMES",   "color": "#00ff88", "icon": "🜲"},
+    {"id": "APOLLO",   "color": "#00cfff", "icon": "☀"},
+    {"id": "ARES",     "color": "#ff9500", "icon": "⚔"},
+    {"id": "POSEIDON", "color": "#40e0d0", "icon": "🜄"},
 ]
 BEAR_AGENTS = [
-    {"id": "KRONOS",  "role": "VALUATION/RISK",   "color": "#ff4466", "icon": "⏳"},
-    {"id": "HADES",   "role": "TECH BREAKDOWN",   "color": "#c084fc", "icon": "☽"},
-    {"id": "NEMESIS", "role": "HEADWINDS",         "color": "#ff6b35", "icon": "⚖"},
+    {"id": "KRONOS",  "color": "#ff4466", "icon": "⏳"},
+    {"id": "HADES",   "color": "#c084fc", "icon": "☽"},
+    {"id": "NEMESIS", "color": "#ff6b35", "icon": "⚖"},
 ]
+
+
+# ── Asset type detection ───────────────────────────────────────────────────────
+_COMMODITY_ETFS = {
+    "GLD","IAU","SGOL","PHYS",                          # Gold
+    "SLV","SIVR","PSLV",                                # Silver
+    "USO","UCO","SCO","BNO",                            # Oil
+    "UNG","BOIL","KOLD",                                # Nat gas
+    "DBA","CORN","WEAT","SOYB",                         # Ag
+    "PDBC","DJP","CPER",                                # Broad commodity
+    "GDX","GDXJ","RING",                                # Miners
+}
+_BROAD_ETFS = {
+    "SPY","VOO","IVV","VTI","QQQ","IWM","DIA","MDY",   # Broad market
+    "TLT","IEF","SHY","BND","AGG","HYG","LQD","TIP",   # Fixed income
+    "XLF","XLK","XLE","XLV","XLU","XLI","XLB","XLC","XLRE","XLP","XLY",  # Sectors
+    "ARKK","ARKG","ARKF","ARKW","ARKO",                # Thematic
+    "VXX","UVXY","SVXY",                                # Volatility
+    "BITO","GBTC","IBIT","FBTC","ETHE","ETHU",         # Crypto ETFs
+    "EEM","EFA","VEA","VWO","EWJ","FXI","MCHI",        # Int'l
+}
+_INDEX_SYMS = {"SPX","NDX","RUT","DJI","VIX","COMP","NYA"}
+
+def _asset_type(sym):
+    s = sym.upper().lstrip("^")
+    if s in _INDEX_SYMS or sym.startswith("^"):
+        return "index"
+    if s in _COMMODITY_ETFS:
+        return "commodity"
+    if s in _BROAD_ETFS:
+        return "etf"
+    return "stock"
+
+
+def _agent_roles(sym, atype):
+    """Return per-agent focus instructions tailored to asset type."""
+    if atype == "commodity":
+        return {
+            "ZEUS":     "physical supply/demand dynamics, global production data, ETF fund flows, and inventory/stockpile levels",
+            "HERMES":   "price momentum using the RSI, MACD, and SMA data provided — cite exact numbers",
+            "APOLLO":   "macro catalysts: Fed policy / dollar strength / inflation data / geopolitical events driving demand",
+            "ARES":     "unusual options activity on {sym} or related ETFs, put/call ratio, and institutional positioning",
+            "POSEIDON": "macro tailwinds: inflation hedge demand, currency debasement, central bank buying, or commodity supercycle",
+            "KRONOS":   "overbought technicals, dollar strength risk, rising real yields, and demand destruction scenarios",
+            "HADES":    "chart-based breakdown risk using the RSI, MACD hist, and SMA levels from the data provided — cite exact numbers",
+            "NEMESIS":  "macro headwinds: Fed tightening, strong dollar, weak industrial demand, or ETF outflows",
+        }
+    elif atype == "etf":
+        return {
+            "ZEUS":     "index/fund composition strength, breadth of holdings, and sector allocation supporting a move up",
+            "HERMES":   "price momentum using the RSI, MACD, and SMA data provided — cite exact numbers",
+            "APOLLO":   "upcoming macro events, Fed policy, earnings season for top holdings, or fund flow catalysts",
+            "ARES":     "unusual options activity, put/call ratio, and institutional ETF flow positioning",
+            "POSEIDON": "macro tailwinds and sector rotation supporting the ETF's holdings and theme",
+            "KRONOS":   "overextended valuation, overbought RSI/technicals, and concentration risk in top holdings",
+            "HADES":    "chart-based breakdown risk using the RSI, MACD hist, and SMA levels from the data — cite exact numbers",
+            "NEMESIS":  "macro headwinds: Fed policy, sector rotation away from holdings, or risk-off sentiment",
+        }
+    elif atype == "index":
+        return {
+            "ZEUS":     "market breadth, advance/decline, and index component strength supporting continued upside",
+            "HERMES":   "index price momentum using the RSI, MACD, and SMA data provided — cite exact numbers",
+            "APOLLO":   "upcoming macro catalysts: FOMC, CPI/PCE data, earnings season, and fiscal policy",
+            "ARES":     "put/call ratio, VIX positioning, and institutional index options flow",
+            "POSEIDON": "global macro tailwinds: liquidity, earnings growth expectations, and risk-on sentiment",
+            "KRONOS":   "valuation stretch (P/E expansion), overbought breadth, and credit market stress signals",
+            "HADES":    "technical breakdown risk using RSI, MACD hist, and key SMA support levels — cite exact numbers",
+            "NEMESIS":  "macro headwinds: Fed tightening, geopolitical risk, recession signals, or earnings deterioration",
+        }
+    else:  # stock
+        return {
+            "ZEUS":     "recent earnings results, revenue growth, forward guidance, and balance sheet strength",
+            "HERMES":   "price momentum using the RSI, MACD, and SMA data provided — cite exact numbers",
+            "APOLLO":   "upcoming catalysts: earnings date, product launches, analyst upgrades, or news events",
+            "ARES":     "unusual options activity, put/call ratio, dark pool prints, and institutional flow",
+            "POSEIDON": "sector tailwinds, macro environment supporting the industry, and peer comparison",
+            "KRONOS":   "valuation metrics (P/E vs peers), debt levels, and margin compression risk",
+            "HADES":    "chart-based breakdown risk using the RSI, MACD hist, and SMA levels from the data — cite exact numbers",
+            "NEMESIS":  "competitive threats, regulatory risk, macro headwinds, or insider selling signals",
+        }
 
 
 def _build_agent_prompt(sym, d, tf, bot_results):
+    atype = _asset_type(sym)
+    asset_label = {"commodity": "commodity/metal ETF", "etf": "broad ETF/fund",
+                   "index": "market index", "stock": "individual stock"}.get(atype, "asset")
+    roles = _agent_roles(sym, atype)
+
     bot_summary = " | ".join(
         "{}: {} {}%".format(BOTS[i]["id"], bot_results[i]["verdict"], bot_results[i]["confidence"])
         for i in range(len(bot_results))
@@ -421,17 +518,21 @@ def _build_agent_prompt(sym, d, tf, bot_results):
     if d:
         pos52 = ((d["px"] - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
         data_s = (
-            "Price ${px} ({sign}{chg}%) | RSI {rsi} | MACD hist {mh} | "
-            "EMA cross {ec} | SMA200 {s200} | PCR {pcr} | 52w pos {pos:.0f}% | "
-            "Vol {vr:.1f}x avg"
+            "Price ${px} ({sign}{chg}%) | RSI {rsi} | MACD hist {mh} ({mdir}) | "
+            "EMA12/26 cross: {ec} | SMA7 ${sma7} | SMA20 ${sma20} | "
+            "SMA200 {s200} | PCR {pcr} | 52w pos {pos:.0f}% | "
+            "Vol {vr:.1f}x avg | 52w High ${h52} / Low ${l52}"
         ).format(
             px=d["px"], sign="+" if d["chg"] >= 0 else "", chg=d["chg"],
             rsi=d["rsi"], mh=d["macd_hist"],
+            mdir="expanding" if abs(d["macd_hist"]) > abs(d["macd_hist_prev"]) else "contracting",
             ec="bullish" if d["ema12"] > d["ema26"] else "bearish",
+            sma7=d["sma7"], sma20=d["sma20"],
             s200=("above ${:.2f}".format(d["sma200"]) if d.get("sma200") and d["px"] > d["sma200"]
                   else "below ${:.2f}".format(d["sma200"]) if d.get("sma200") else "N/A"),
             pcr=d["pcr"] if d["pcr"] is not None else "N/A",
             pos=pos52, vr=d["vol_ratio"],
+            h52=d["high_52"], l52=d["low_52"],
         )
     else:
         data_s = "Live data unavailable — use your knowledge of {}.".format(sym)
@@ -445,23 +546,28 @@ def _build_agent_prompt(sym, d, tf, bot_results):
         tf_s = "TF data unavailable"
 
     return (
-        "8 AI agents are debating whether to buy a CALL or PUT option on {sym}.\n"
-        "CALL = expecting price to go UP. PUT = expecting price to go DOWN.\n\n"
-        "Market snapshot: {data}\n"
+        "{sym} is a {asset_label}. 8 AI agents debate CALL (price UP) vs PUT (price DOWN).\n\n"
+        "LIVE DATA — agents MUST reference these exact numbers in their arguments:\n"
+        "{data}\n"
         "Timeframes: {tf}\n"
-        "Technical bots voted: {bots}\n\n"
-        "BULL agents (must argue for CALL/price UP): "
-        "ZEUS (earnings/fundamentals), HERMES (price momentum), "
-        "APOLLO (news/upcoming catalysts), ARES (unusual options activity/dark pool), "
-        "POSEIDON (macro tailwinds/sector rotation).\n"
-        "BEAR agents (must argue for PUT/price DOWN): "
-        "KRONOS (overvaluation/risk metrics), "
-        "HADES (bearish technicals/chart breakdown), "
-        "NEMESIS (macro headwinds/competitive threats).\n\n"
-        "Rules: Each agent argues their assigned side with 2 specific sentences. "
-        "Set price_target relative to current price ${px}. "
-        "bull_prob + bear_prob = 100. consensus_target = probability-weighted average. "
-        "final_verdict = CALL if bull_prob>50, else PUT.\n\n"
+        "Technical bots: {bots}\n\n"
+        "CRITICAL: {sym} is a {asset_label}. Arguments must be appropriate to this asset class.\n"
+        "{no_earnings_note}\n\n"
+        "BULL agents argue for price going UP — each uses their specific lens:\n"
+        "• ZEUS analyzes: {zeus}\n"
+        "• HERMES analyzes: {hermes}\n"
+        "• APOLLO analyzes: {apollo}\n"
+        "• ARES analyzes: {ares}\n"
+        "• POSEIDON analyzes: {poseidon}\n\n"
+        "BEAR agents argue for price going DOWN — each uses their specific lens:\n"
+        "• KRONOS analyzes: {kronos}\n"
+        "• HADES analyzes: {hades}\n"
+        "• NEMESIS analyzes: {nemesis}\n\n"
+        "Rules:\n"
+        "- Each agent writes exactly 2 specific sentences citing real data or real-world factors for {sym}.\n"
+        "- price_target must be a realistic number relative to current ${px}.\n"
+        "- bull_prob + bear_prob = 100. consensus_target = probability-weighted price target.\n"
+        "- final_verdict = CALL if bull_prob > 50, else PUT.\n\n"
         "Reply with ONLY this JSON (no markdown, no backticks):\n"
         '{{"agents":{{'
         '"ZEUS":{{"argument":"...","price_target":0.0,"confidence":70}},'
@@ -473,11 +579,22 @@ def _build_agent_prompt(sym, d, tf, bot_results):
         '"HADES":{{"argument":"...","price_target":0.0,"confidence":70}},'
         '"NEMESIS":{{"argument":"...","price_target":0.0,"confidence":70}}'
         '}},'
-        '"debate":"2 sentences summarizing which side made the stronger case and why.",'
+        '"debate":"2 sentences on which side won and the key deciding factor.",'
         '"bull_prob":60,"bear_prob":40,'
         '"consensus_target":0.0,'
         '"verdict":"CALL"}}'
-    ).format(sym=sym, data=data_s, tf=tf_s, bots=bot_summary, px=px)
+    ).format(
+        sym=sym, asset_label=asset_label,
+        data=data_s, tf=tf_s, bots=bot_summary, px=px,
+        no_earnings_note=(
+            "DO NOT mention company earnings, revenue, or P/E ratios — {sym} is NOT a company stock.".format(sym=sym)
+            if atype in ("commodity", "etf", "index") else
+            "Ground all fundamental claims in known or estimated data for {sym}.".format(sym=sym)
+        ),
+        zeus=roles["ZEUS"], hermes=roles["HERMES"], apollo=roles["APOLLO"],
+        ares=roles["ARES"], poseidon=roles["POSEIDON"],
+        kronos=roles["KRONOS"], hades=roles["HADES"], nemesis=roles["NEMESIS"],
+    )
 
 
 def run_agents(sym, api_key, provider, market_data, tf_data, bot_results):
@@ -928,8 +1045,11 @@ if st.session_state.get("agent_error"):
 agent_data = st.session_state.get("agent_results")
 if agent_data:
     agents_raw = agent_data.get("agents", {})
+    cur_atype  = _asset_type(ticker)
+    bull_roles = _BULL_AGENT_ROLES.get(cur_atype, _BULL_AGENT_ROLES["stock"])
+    bear_roles = _BEAR_AGENT_ROLES.get(cur_atype, _BEAR_AGENT_ROLES["stock"])
 
-    def _agent_card(agent_def, side):
+    def _agent_card(agent_def, side, role_label):
         a = agents_raw.get(agent_def["id"], {})
         bc = agent_def["color"]
         sc = "#00ff88" if side == "BULL" else "#ff4466"
@@ -960,21 +1080,21 @@ if agent_data:
     <span style="color:{bc};font-size:10px;font-weight:800">{conf}%</span>
   </div>
 </div>""".format(bc=bc, sc=sc, icon=agent_def["icon"], id=agent_def["id"],
-                 role=agent_def["role"], side=side_lbl, arg=arg, pt=pt_html, conf=conf)
+                 role=role_label, side=side_lbl, arg=arg, pt=pt_html, conf=conf)
 
     # Bull agents header
     st.markdown('<div style="color:#ffd70077;font-size:10px;font-weight:800;letter-spacing:3px;margin:8px 0 4px">▲ BULL CASE — 5 AGENTS</div>', unsafe_allow_html=True)
     bc1, bc2, bc3 = st.columns(3)
     bull_cols = [bc1, bc2, bc3, bc1, bc2]
     for i, ag in enumerate(BULL_AGENTS):
-        bull_cols[i].markdown(_agent_card(ag, "BULL"), unsafe_allow_html=True)
+        bull_cols[i].markdown(_agent_card(ag, "BULL", bull_roles[i]), unsafe_allow_html=True)
 
     # Bear agents header
     st.markdown('<div style="color:#ff446677;font-size:10px;font-weight:800;letter-spacing:3px;margin:8px 0 4px">▼ BEAR CASE — 3 AGENTS</div>', unsafe_allow_html=True)
     br1, br2, br3 = st.columns(3)
     bear_cols = [br1, br2, br3]
     for i, ag in enumerate(BEAR_AGENTS):
-        bear_cols[i].markdown(_agent_card(ag, "BEAR"), unsafe_allow_html=True)
+        bear_cols[i].markdown(_agent_card(ag, "BEAR", bear_roles[i]), unsafe_allow_html=True)
 
     # Debate summary + probability
     debate_txt  = str(agent_data.get("debate", "Debate complete."))
