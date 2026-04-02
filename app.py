@@ -349,16 +349,36 @@ def _parse_bot(bot_id, data):
             "analysis": analysis, "metrics": metrics, "reversal": reversal}
 
 
-def run_swarm(sym, api_key, market_data, tf_data):
-    client = anthropic.Anthropic(api_key=api_key)
+def run_swarm(sym, api_key, provider, market_data, tf_data):
     prompt = _build_prompt(sym, market_data, tf_data)
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1400,
-        system="You are a stock analysis API. Output ONLY a raw JSON object. No markdown. No explanation. Just JSON.",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw  = "".join(c.text for c in msg.content if hasattr(c, "text")).strip()
+    system = "You are a stock analysis API. Output ONLY a raw JSON object. No markdown. No explanation. Just JSON."
+
+    if provider == "groq":
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user",   "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 1400,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+    else:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1400,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(c.text for c in msg.content if hasattr(c, "text")).strip()
+
     data = _extract_json(raw)
     if data is None:
         raise ValueError("Could not parse JSON: " + raw[:200])
@@ -366,8 +386,12 @@ def run_swarm(sym, api_key, market_data, tf_data):
 
 
 # ── Session state ──────────────────────────────────────────────────────────────
-if "ant_key" not in st.session_state:
-    st.session_state["ant_key"] = os.getenv("ANTHROPIC_API_KEY", "")
+if "ant_key"  not in st.session_state:
+    st.session_state["ant_key"]  = os.getenv("ANTHROPIC_API_KEY", "")
+if "groq_key" not in st.session_state:
+    st.session_state["groq_key"] = os.getenv("GROQ_API_KEY", "")
+if "provider" not in st.session_state:
+    st.session_state["provider"] = "groq" if os.getenv("GROQ_API_KEY") else "anthropic"
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -380,35 +404,66 @@ with st.sidebar:
       5-BOT PUT/CALL ANALYZER
     </div>""", unsafe_allow_html=True)
 
-    st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:4px">ANTHROPIC KEY</div>', unsafe_allow_html=True)
-    new_key = st.text_input("API Key", type="password", placeholder="sk-ant-api03-...",
-                            label_visibility="collapsed", key="key_input")
-    c1, c2 = st.columns(2)
-    if c1.button("SAVE", use_container_width=True, key="save_btn"):
-        k = new_key.strip()
-        if k.startswith("sk-ant-"):
-            st.session_state["ant_key"] = k
-            set_key(_ENV_PATH, "ANTHROPIC_API_KEY", k)
-            st.success("Saved to .env ✓")
-        else:
-            st.error("Must start with sk-ant-")
-    if c2.button("CLEAR", use_container_width=True, key="clear_btn"):
-        st.session_state["ant_key"] = ""
-        set_key(_ENV_PATH, "ANTHROPIC_API_KEY", "")
-        st.rerun()
+    # ── Provider toggle ──
+    st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:6px">AI PROVIDER</div>', unsafe_allow_html=True)
+    provider_choice = st.radio("Provider", ["Groq (Free)", "Anthropic"],
+                               index=0 if st.session_state["provider"] == "groq" else 1,
+                               label_visibility="collapsed", horizontal=True, key="provider_radio")
+    st.session_state["provider"] = "groq" if provider_choice == "Groq (Free)" else "anthropic"
 
-    if st.session_state["ant_key"]:
-        st.markdown('<div style="color:#00ff8877;font-size:9px;margin-top:4px">● Key loaded</div>', unsafe_allow_html=True)
+    st.markdown("---")
+
+    if st.session_state["provider"] == "groq":
+        st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:4px">GROQ KEY <span style="color:#00ff8855">(free)</span></div>', unsafe_allow_html=True)
+        new_groq = st.text_input("Groq Key", type="password", placeholder="gsk_...",
+                                 label_visibility="collapsed", key="groq_input")
+        g1, g2 = st.columns(2)
+        if g1.button("SAVE", use_container_width=True, key="save_groq"):
+            k = new_groq.strip()
+            if k.startswith("gsk_"):
+                st.session_state["groq_key"] = k
+                set_key(_ENV_PATH, "GROQ_API_KEY", k)
+                st.success("Saved ✓")
+            else:
+                st.error("Must start with gsk_")
+        if g2.button("CLEAR", use_container_width=True, key="clear_groq"):
+            st.session_state["groq_key"] = ""
+            set_key(_ENV_PATH, "GROQ_API_KEY", "")
+            st.rerun()
+        if st.session_state["groq_key"]:
+            st.markdown('<div style="color:#00ff8877;font-size:9px;margin-top:4px">● Groq key loaded</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="color:#ff446677;font-size:9px;margin-top:4px">○ No key — get free key at console.groq.com</div>', unsafe_allow_html=True)
     else:
-        st.markdown('<div style="color:#ff446677;font-size:9px;margin-top:4px">○ No key set</div>', unsafe_allow_html=True)
+        st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:4px">ANTHROPIC KEY</div>', unsafe_allow_html=True)
+        new_ant = st.text_input("Anthropic Key", type="password", placeholder="sk-ant-api03-...",
+                                label_visibility="collapsed", key="ant_input")
+        a1, a2 = st.columns(2)
+        if a1.button("SAVE", use_container_width=True, key="save_ant"):
+            k = new_ant.strip()
+            if k.startswith("sk-ant-"):
+                st.session_state["ant_key"] = k
+                set_key(_ENV_PATH, "ANTHROPIC_API_KEY", k)
+                st.success("Saved ✓")
+            else:
+                st.error("Must start with sk-ant-")
+        if a2.button("CLEAR", use_container_width=True, key="clear_ant"):
+            st.session_state["ant_key"] = ""
+            set_key(_ENV_PATH, "ANTHROPIC_API_KEY", "")
+            st.rerun()
+        if st.session_state["ant_key"]:
+            st.markdown('<div style="color:#00ff8877;font-size:9px;margin-top:4px">● Anthropic key loaded</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="color:#ff446677;font-size:9px;margin-top:4px">○ No key set</div>', unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:4px">TICKER SYMBOL</div>', unsafe_allow_html=True)
     ticker = st.text_input("Ticker", placeholder="AAPL  TSLA  SPY...",
                            label_visibility="collapsed", key="ticker_inp").strip().upper()
 
+    _active_key = st.session_state["groq_key"] if st.session_state["provider"] == "groq" else st.session_state["ant_key"]
     run_btn = st.button("▶ ANALYZE", use_container_width=True,
-                        disabled=not (st.session_state["ant_key"] and ticker),
+                        disabled=not (_active_key and ticker),
                         key="run_btn")
     st.markdown("---")
     st.markdown('<div style="color:#1e1e30;font-size:9px">⚠ AI only — not financial advice</div>', unsafe_allow_html=True)
@@ -430,13 +485,15 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if not st.session_state["ant_key"]:
+_active_key = st.session_state["groq_key"] if st.session_state["provider"] == "groq" else st.session_state["ant_key"]
+if not _active_key:
+    _hint = "Get a free key at console.groq.com" if st.session_state["provider"] == "groq" else "Get a key at console.anthropic.com"
     st.markdown("""
     <div style="text-align:center;padding:40px 20px;color:#334">
       <div style="font-size:32px;margin-bottom:12px">🔑</div>
-      <div style="font-size:13px;letter-spacing:1px">Paste your Anthropic API key in the sidebar to get started.</div>
-      <div style="font-size:10px;margin-top:8px;color:#222">Get a free key at console.anthropic.com</div>
-    </div>""", unsafe_allow_html=True)
+      <div style="font-size:13px;letter-spacing:1px">Paste your API key in the sidebar to get started.</div>
+      <div style="font-size:10px;margin-top:8px;color:#222">{hint}</div>
+    </div>""".format(hint=_hint), unsafe_allow_html=True)
     st.stop()
 
 if not ticker:
@@ -521,7 +578,7 @@ st.markdown("""
 if run_btn:
     with st.spinner("Deploying 5-bot swarm on {}...".format(ticker)):
         try:
-            results, raw = run_swarm(ticker, st.session_state["ant_key"], md, tf)
+            results, raw = run_swarm(ticker, _active_key, st.session_state["provider"], md, tf)
             st.session_state["swarm_results"] = results
             st.session_state["swarm_ticker"]  = ticker
             st.session_state["swarm_raw"]     = raw
