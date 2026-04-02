@@ -1,6 +1,5 @@
 import streamlit as st
 import anthropic
-import yfinance as yf
 import requests
 import pandas as pd
 import numpy as np
@@ -57,22 +56,14 @@ _YF_HEADERS = {
 }
 
 def _fetch_df(sym, interval, period):
-    """Try yf.Ticker().history() first, fall back to requests v8 API."""
-    # Primary: yfinance Ticker history (avoids proxy issues better than download)
-    try:
-        tk = yf.Ticker(sym)
-        df = tk.history(period=period, interval=interval, auto_adjust=True)
-        if not df.empty and len(df) >= 5:
-            df.index = df.index.tz_localize(None) if df.index.tzinfo is not None else df.index
-            return df
-    except Exception:
-        pass
-    # Fallback: direct Yahoo Finance v8 API via requests
-    try:
-        url = "https://query2.finance.yahoo.com/v8/finance/chart/" + sym
-        r = requests.get(url, params={"interval": interval, "range": period},
-                         headers=_YF_HEADERS, timeout=12)
-        if r.ok:
+    """Fetch OHLCV from Yahoo Finance v8 API via requests."""
+    for host in ("query2.finance.yahoo.com", "query1.finance.yahoo.com"):
+        try:
+            url = "https://{}/v8/finance/chart/{}".format(host, sym)
+            r = requests.get(url, params={"interval": interval, "range": period},
+                             headers=_YF_HEADERS, timeout=12)
+            if not r.ok:
+                continue
             res = r.json()["chart"]["result"][0]
             ts  = res["timestamp"]
             q   = res["indicators"]["quote"][0]
@@ -83,8 +74,8 @@ def _fetch_df(sym, interval, period):
             df = df.dropna(subset=["Close"])
             if len(df) >= 5:
                 return df
-    except Exception:
-        pass
+        except Exception:
+            continue
     return None
 
 
@@ -150,15 +141,17 @@ def fetch_market_data(sym):
         high_52 = float(h.rolling(min(252, len(h))).max().iloc[-1])
         low_52  = float(l.rolling(min(252, len(l))).min().iloc[-1])
 
-        # Options PCR
+        # Options PCR via Yahoo Finance v7 options API
         pcr = None
         try:
-            tk   = yf.Ticker(sym)
-            exps = tk.options
-            if exps:
-                chain = tk.option_chain(exps[0])
-                put_oi  = chain.puts["openInterest"].sum()
-                call_oi = chain.calls["openInterest"].sum()
+            r = requests.get(
+                "https://query2.finance.yahoo.com/v7/finance/options/" + sym,
+                headers=_YF_HEADERS, timeout=10)
+            if r.ok:
+                opts = r.json().get("optionChain", {}).get("result", [{}])[0]
+                chain = opts.get("options", [{}])[0]
+                call_oi = sum(c.get("openInterest", 0) for c in chain.get("calls", []))
+                put_oi  = sum(p.get("openInterest", 0) for p in chain.get("puts",  []))
                 if call_oi > 0:
                     pcr = round(put_oi / call_oi, 2)
         except Exception:
