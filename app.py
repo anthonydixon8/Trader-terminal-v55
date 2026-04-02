@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import math
+import datetime
 from dotenv import load_dotenv, set_key
 
 load_dotenv()
@@ -84,6 +86,108 @@ def _calc_rsi(c, p=14):
     g = d.clip(lower=0).ewm(com=p - 1, adjust=False).mean()
     l = (-d.clip(upper=0)).ewm(com=p - 1, adjust=False).mean()
     return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
+
+# ── Black-Scholes Greeks ───────────────────────────────────────────────────────
+def _ncdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _npdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+def _bs_greeks(S, K, T, r, sigma, is_call):
+    """Compute Black-Scholes Delta/Gamma/Theta/Vega for one contract."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return None
+    try:
+        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        delta = _ncdf(d1) if is_call else (_ncdf(d1) - 1.0)
+        gamma = _npdf(d1) / (S * sigma * math.sqrt(T))
+        vega  = S * _npdf(d1) * math.sqrt(T) / 100.0        # per 1% IV move
+        if is_call:
+            theta = (-(S * _npdf(d1) * sigma) / (2 * math.sqrt(T))
+                     - r * K * math.exp(-r * T) * _ncdf(d2)) / 365.0
+        else:
+            theta = (-(S * _npdf(d1) * sigma) / (2 * math.sqrt(T))
+                     + r * K * math.exp(-r * T) * _ncdf(-d2)) / 365.0
+        return {"delta": round(delta, 3), "gamma": round(gamma, 5),
+                "theta": round(theta, 4), "vega": round(vega, 4)}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300)
+def fetch_options_greeks(sym):
+    """Fetch nearest-expiry ATM options, compute Greeks, return summary dict."""
+    for host in ("query2.finance.yahoo.com", "query1.finance.yahoo.com"):
+        try:
+            url = "https://{}/v7/finance/options/{}".format(host, sym)
+            r = requests.get(url, headers=_YF_HEADERS, timeout=12)
+            if not r.ok:
+                continue
+            result = r.json().get("optionChain", {}).get("result", [])
+            if not result:
+                continue
+            res   = result[0]
+            quote = res.get("quote", {})
+            spot  = float(quote.get("regularMarketPrice", 0) or 0)
+            if spot <= 0:
+                break
+
+            options = res.get("options", [])
+            if not options:
+                break
+            chain = options[0]
+
+            exp_dates = res.get("expirationDates", [])
+            if exp_dates:
+                exp_dt = datetime.datetime.fromtimestamp(exp_dates[0])
+                T = max(1 / 365, (exp_dt - datetime.datetime.now()).days / 365.0)
+                days_out = (exp_dt - datetime.datetime.now()).days
+            else:
+                T, days_out = 30 / 365.0, 30
+
+            calls = chain.get("calls", [])
+            puts  = chain.get("puts",  [])
+            if not calls or not puts:
+                break
+
+            atm_call = min(calls, key=lambda c: abs(float(c.get("strike", 0) or 0) - spot))
+            atm_put  = min(puts,  key=lambda p: abs(float(p.get("strike", 0) or 0) - spot))
+            K        = float(atm_call.get("strike", spot) or spot)
+            call_iv  = float(atm_call.get("impliedVolatility", 0) or 0)
+            put_iv   = float(atm_put.get("impliedVolatility",  0) or 0)
+            avg_iv   = (call_iv + put_iv) / 2 if call_iv and put_iv else (call_iv or put_iv)
+
+            r_rf = 0.05
+            cg = _bs_greeks(spot, K, T, r_rf, call_iv, True)  if call_iv > 0 else None
+            pg = _bs_greeks(spot, K, T, r_rf, put_iv,  False) if put_iv  > 0 else None
+
+            call_oi = sum(int(c.get("openInterest", 0) or 0) for c in calls)
+            put_oi  = sum(int(p.get("openInterest", 0) or 0) for p in puts)
+            pcr = round(put_oi / call_oi, 2) if call_oi > 0 else None
+
+            return {
+                "spot":       round(spot, 2),
+                "atm_strike": round(K, 2),
+                "days_out":   days_out,
+                "call_iv":    round(call_iv * 100, 1),
+                "put_iv":     round(put_iv  * 100, 1),
+                "avg_iv":     round(avg_iv  * 100, 1),
+                "call_greeks": cg,
+                "put_greeks":  pg,
+                "call_bid":   round(float(atm_call.get("bid", 0) or 0), 2),
+                "call_ask":   round(float(atm_call.get("ask", 0) or 0), 2),
+                "put_bid":    round(float(atm_put.get("bid",  0) or 0), 2),
+                "put_ask":    round(float(atm_put.get("ask",  0) or 0), 2),
+                "call_oi":    call_oi,
+                "put_oi":     put_oi,
+                "pcr":        pcr,
+            }
+        except Exception:
+            continue
+    return None
 
 
 @st.cache_data(ttl=60)
@@ -504,7 +608,7 @@ def _agent_roles(sym, atype):
         }
 
 
-def _build_agent_prompt(sym, d, tf, bot_results):
+def _build_agent_prompt(sym, d, tf, bot_results, greeks):
     atype = _asset_type(sym)
     asset_label = {"commodity": "commodity/metal ETF", "etf": "broad ETF/fund",
                    "index": "market index", "stock": "individual stock"}.get(atype, "asset")
@@ -545,29 +649,86 @@ def _build_agent_prompt(sym, d, tf, bot_results):
     else:
         tf_s = "TF data unavailable"
 
+    # Greeks block for ARES and timeline guidance
+    if greeks:
+        cg = greeks.get("call_greeks") or {}
+        pg = greeks.get("put_greeks")  or {}
+        greeks_s = (
+            "ATM STRIKE: ${atm} | Days to Expiry: {dte} | "
+            "Call IV: {civ}% | Put IV: {piv}% | Avg IV: {aiv}%\n"
+            "CALL Greeks — Delta: {cd} | Gamma: {cg} | Theta: ${ct}/day | Vega: ${cv}/1%IV | "
+            "Bid/Ask: ${cb}/${ca}\n"
+            "PUT  Greeks — Delta: {pd} | Gamma: {pgg} | Theta: ${pt}/day | Vega: ${pv}/1%IV | "
+            "Bid/Ask: ${pb}/${pa}\n"
+            "Open Interest — Calls: {coi:,} | Puts: {poi:,} | PCR: {pcr}"
+        ).format(
+            atm=greeks["atm_strike"], dte=greeks["days_out"],
+            civ=greeks["call_iv"], piv=greeks["put_iv"], aiv=greeks["avg_iv"],
+            cd=cg.get("delta","N/A"), cg=cg.get("gamma","N/A"),
+            ct=cg.get("theta","N/A"), cv=cg.get("vega","N/A"),
+            cb=greeks["call_bid"], ca=greeks["call_ask"],
+            pd=pg.get("delta","N/A"), pgg=pg.get("gamma","N/A"),
+            pt=pg.get("theta","N/A"), pv=pg.get("vega","N/A"),
+            pb=greeks["put_bid"], pa=greeks["put_ask"],
+            coi=greeks["call_oi"], poi=greeks["put_oi"],
+            pcr=greeks["pcr"] if greeks["pcr"] is not None else "N/A",
+        )
+        # Timeline guidance based on IV and DTE
+        dte = greeks["days_out"]
+        avg_iv = greeks["avg_iv"]
+        if dte <= 3:
+            tl_hint = "scalp (0-1 day) — very short DTE, extreme theta decay"
+        elif dte <= 10:
+            tl_hint = "short (1-5 days) — low DTE, momentum play"
+        elif avg_iv > 60:
+            tl_hint = "short-to-swing — high IV means options are expensive, don't hold too long"
+        elif avg_iv < 25:
+            tl_hint = "swing-to-long (2-6 weeks) — cheap IV, good for holding through a move"
+        else:
+            tl_hint = "swing (1-4 weeks) — moderate IV and DTE"
+    else:
+        greeks_s = "Options Greeks unavailable — use your best estimate based on price action."
+        tl_hint  = "swing (1-4 weeks) — default estimate"
+
+    # Override ARES role to always focus on Greeks when available
+    ares_role = (
+        "options Greeks and structure: given the data above (Delta, Theta, Vega, IV, DTE), "
+        "argue why the CALL side is the better options trade right now — "
+        "address IV level, theta cost, and delta exposure"
+    ) if greeks else roles["ARES"]
+    kronos_role = (
+        "options Greeks risk: given theta decay rate, IV level, and DTE, "
+        "argue why the current options pricing makes buying calls risky — "
+        "cite specific theta cost, IV crush risk, or unfavorable Greeks"
+    ) if greeks else roles["KRONOS"]
+
     return (
         "{sym} is a {asset_label}. 8 AI agents debate CALL (price UP) vs PUT (price DOWN).\n\n"
-        "LIVE DATA — agents MUST reference these exact numbers in their arguments:\n"
-        "{data}\n"
+        "MARKET DATA:\n{data}\n"
         "Timeframes: {tf}\n"
-        "Technical bots: {bots}\n\n"
+        "Technical bots voted: {bots}\n\n"
+        "OPTIONS & GREEKS DATA:\n{greeks}\n\n"
+        "Suggested hold timeline based on options structure: {tl_hint}\n\n"
         "CRITICAL: {sym} is a {asset_label}. Arguments must be appropriate to this asset class.\n"
         "{no_earnings_note}\n\n"
-        "BULL agents argue for price going UP — each uses their specific lens:\n"
-        "• ZEUS analyzes: {zeus}\n"
-        "• HERMES analyzes: {hermes}\n"
-        "• APOLLO analyzes: {apollo}\n"
-        "• ARES analyzes: {ares}\n"
-        "• POSEIDON analyzes: {poseidon}\n\n"
-        "BEAR agents argue for price going DOWN — each uses their specific lens:\n"
-        "• KRONOS analyzes: {kronos}\n"
-        "• HADES analyzes: {hades}\n"
-        "• NEMESIS analyzes: {nemesis}\n\n"
+        "BULL agents (argue for CALL / price UP):\n"
+        "• ZEUS: {zeus}\n"
+        "• HERMES: {hermes}\n"
+        "• APOLLO: {apollo}\n"
+        "• ARES: {ares}\n"
+        "• POSEIDON: {poseidon}\n\n"
+        "BEAR agents (argue for PUT / price DOWN):\n"
+        "• KRONOS: {kronos}\n"
+        "• HADES: {hades}\n"
+        "• NEMESIS: {nemesis}\n\n"
         "Rules:\n"
-        "- Each agent writes exactly 2 specific sentences citing real data or real-world factors for {sym}.\n"
-        "- price_target must be a realistic number relative to current ${px}.\n"
+        "- Each agent writes exactly 2 specific sentences, citing actual data numbers.\n"
+        "- price_target must be realistic relative to current ${px}.\n"
         "- bull_prob + bear_prob = 100. consensus_target = probability-weighted price target.\n"
-        "- final_verdict = CALL if bull_prob > 50, else PUT.\n\n"
+        "- final_verdict = CALL if bull_prob > 50, else PUT.\n"
+        "- timeline = consensus hold duration: scalp (0-1 day), short (1-5 days), "
+        "swing (1-4 weeks), or long (1-3 months). Consider Greeks, IV, and signal strength.\n"
+        "- timeline_reason = one sentence explaining WHY that hold duration (reference theta, IV, DTE).\n\n"
         "Reply with ONLY this JSON (no markdown, no backticks):\n"
         '{{"agents":{{'
         '"ZEUS":{{"argument":"...","price_target":0.0,"confidence":70}},'
@@ -579,26 +740,29 @@ def _build_agent_prompt(sym, d, tf, bot_results):
         '"HADES":{{"argument":"...","price_target":0.0,"confidence":70}},'
         '"NEMESIS":{{"argument":"...","price_target":0.0,"confidence":70}}'
         '}},'
-        '"debate":"2 sentences on which side won and the key deciding factor.",'
+        '"debate":"2 sentences — which side won and the key deciding factor.",'
         '"bull_prob":60,"bear_prob":40,'
         '"consensus_target":0.0,'
-        '"verdict":"CALL"}}'
+        '"verdict":"CALL",'
+        '"timeline":"swing",'
+        '"timeline_reason":"..."}}'
     ).format(
         sym=sym, asset_label=asset_label,
         data=data_s, tf=tf_s, bots=bot_summary, px=px,
+        greeks=greeks_s, tl_hint=tl_hint,
         no_earnings_note=(
             "DO NOT mention company earnings, revenue, or P/E ratios — {sym} is NOT a company stock.".format(sym=sym)
             if atype in ("commodity", "etf", "index") else
             "Ground all fundamental claims in known or estimated data for {sym}.".format(sym=sym)
         ),
         zeus=roles["ZEUS"], hermes=roles["HERMES"], apollo=roles["APOLLO"],
-        ares=roles["ARES"], poseidon=roles["POSEIDON"],
-        kronos=roles["KRONOS"], hades=roles["HADES"], nemesis=roles["NEMESIS"],
+        ares=ares_role, poseidon=roles["POSEIDON"],
+        kronos=kronos_role, hades=roles["HADES"], nemesis=roles["NEMESIS"],
     )
 
 
-def run_agents(sym, api_key, provider, market_data, tf_data, bot_results):
-    prompt = _build_agent_prompt(sym, market_data, tf_data, bot_results)
+def run_agents(sym, api_key, provider, market_data, tf_data, bot_results, greeks=None):
+    prompt = _build_agent_prompt(sym, market_data, tf_data, bot_results, greeks)
     system = "You are a multi-agent financial debate API. Output ONLY raw JSON. No markdown, no explanation, no backticks."
 
     if provider == "groq":
@@ -644,6 +808,8 @@ if "agent_results" not in st.session_state:
     st.session_state["agent_results"] = None
 if "agent_raw" not in st.session_state:
     st.session_state["agent_raw"] = None
+if "greeks_data" not in st.session_state:
+    st.session_state["greeks_data"] = None
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -759,6 +925,7 @@ if not ticker:
 # ── Live data ──────────────────────────────────────────────────────────────────
 md = fetch_market_data(ticker)
 tf = fetch_tf_data(ticker)
+og = fetch_options_greeks(ticker)
 if md:
     up = md["chg"] >= 0
     cc = "#00ff88" if up else "#ff4466"
@@ -804,6 +971,62 @@ if md:
 else:
     st.info("Live price data unavailable for {} — analysis will run using AI estimation.".format(ticker))
 
+# ── Options Greeks panel ──────────────────────────────────────────────────────
+if og:
+    cg = og.get("call_greeks") or {}
+    pg = og.get("put_greeks")  or {}
+    def _gfmt(v):
+        return "{:+.3f}".format(v) if isinstance(v, float) else str(v)
+    iv_color = "#ff4466" if og["avg_iv"] > 60 else "#ffd700" if og["avg_iv"] > 35 else "#00ff88"
+    st.markdown("""
+<div style="background:linear-gradient(135deg,#08081a,#0d0d22);border:1px solid #1c1c3055;
+  border-radius:10px;padding:10px 16px;margin-bottom:12px;overflow-x:auto">
+  <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+    <span style="color:#c084fc;font-size:10px;font-weight:800;letter-spacing:2px">⚙ OPTIONS GREEKS</span>
+    <span style="color:#334;font-size:9px">· ATM ${atm} · {dte}d to expiry</span>
+    <span style="margin-left:auto;padding:2px 8px;border-radius:6px;background:{ivc}18;
+      border:1px solid {ivc}44;color:{ivc};font-size:9px;font-weight:800">IV {aiv}%</span>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <div style="background:#05050f;border-radius:7px;padding:9px;border:1px solid #00ff8818">
+      <div style="color:#00ff88;font-size:9px;font-weight:800;margin-bottom:5px">▲ CALL · ${cb}–${ca}</div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <span style="color:#556;font-size:9px">Δ <span style="color:#00ff88">{cd}</span></span>
+        <span style="color:#556;font-size:9px">Γ <span style="color:#00ff88">{cg}</span></span>
+        <span style="color:#556;font-size:9px">Θ <span style="color:#ff4466">{ct}/day</span></span>
+        <span style="color:#556;font-size:9px">ν <span style="color:#ffd700">{cv}/1%IV</span></span>
+        <span style="color:#556;font-size:9px">IV <span style="color:#00cfff">{civ}%</span></span>
+      </div>
+    </div>
+    <div style="background:#05050f;border-radius:7px;padding:9px;border:1px solid #ff446618">
+      <div style="color:#ff4466;font-size:9px;font-weight:800;margin-bottom:5px">▼ PUT · ${pb}–${pa}</div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <span style="color:#556;font-size:9px">Δ <span style="color:#ff4466">{pd}</span></span>
+        <span style="color:#556;font-size:9px">Γ <span style="color:#ff4466">{pgg}</span></span>
+        <span style="color:#556;font-size:9px">Θ <span style="color:#ff4466">{pt}/day</span></span>
+        <span style="color:#556;font-size:9px">ν <span style="color:#ffd700">{pv}/1%IV</span></span>
+        <span style="color:#556;font-size:9px">IV <span style="color:#00cfff">{piv}%</span></span>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;gap:14px;margin-top:7px">
+    <span style="color:#334;font-size:9px">OI Calls: <span style="color:#00ff8877">{coi:,}</span></span>
+    <span style="color:#334;font-size:9px">OI Puts: <span style="color:#ff446677">{poi:,}</span></span>
+    <span style="color:#334;font-size:9px">PCR: <span style="color:#ffd700">{pcr}</span></span>
+  </div>
+</div>""".format(
+        atm=og["atm_strike"], dte=og["days_out"],
+        aiv=og["avg_iv"], ivc=iv_color,
+        cb=og["call_bid"], ca=og["call_ask"],
+        cd=_gfmt(cg.get("delta")), cg=_gfmt(cg.get("gamma")),
+        ct=_gfmt(cg.get("theta")), cv=_gfmt(cg.get("vega")), civ=og["call_iv"],
+        pb=og["put_bid"], pa=og["put_ask"],
+        pd=_gfmt(pg.get("delta")), pgg=_gfmt(pg.get("gamma")),
+        pt=_gfmt(pg.get("theta")), pv=_gfmt(pg.get("vega")), piv=og["put_iv"],
+        coi=og["call_oi"], poi=og["put_oi"],
+        pcr=og["pcr"] if og["pcr"] is not None else "N/A",
+    ), unsafe_allow_html=True)
+
 # ── TradingView chart ──────────────────────────────────────────────────────────
 tv_src = (
     "https://s.tradingview.com/widgetembed/?frameElementId=tv"
@@ -845,8 +1068,9 @@ if run_btn:
             try:
                 agent_data, agent_raw = run_agents(
                     ticker, _active_key, st.session_state["provider"],
-                    md, tf, st.session_state["swarm_results"]
+                    md, tf, st.session_state["swarm_results"], og
                 )
+                st.session_state["greeks_data"] = og
                 st.session_state["agent_results"] = agent_data
                 st.session_state["agent_raw"]     = agent_raw
                 st.session_state.pop("agent_error", None)
@@ -1149,14 +1373,23 @@ if agent_data:
         bp=bull_prob, brp=bear_prob,
     ), unsafe_allow_html=True)
 
-    # Combined verdict (bots + agents)
+    # Timeline from agents
+    tl_raw    = str(agent_data.get("timeline", "swing")).lower().strip()
+    tl_reason = str(agent_data.get("timeline_reason", "")).strip()
+    tl_labels = {
+        "scalp": ("SCALP", "0 – 1 DAY",     "#ff9500"),
+        "short": ("SHORT", "1 – 5 DAYS",     "#ffd700"),
+        "swing": ("SWING", "1 – 4 WEEKS",    "#00cfff"),
+        "long":  ("LONG",  "1 – 3 MONTHS",   "#c084fc"),
+    }
+    tl_key  = next((k for k in tl_labels if k in tl_raw), "swing")
+    tl_name, tl_range, tl_color = tl_labels[tl_key]
+
+    # Combined verdict (bots 40% + agents 60%)
     bot_calls = sum(1 for r in results if r["verdict"] == "CALL")
-    bot_puts  = len(results) - bot_calls
-    # Weight: bots 40%, agents 60%
     bot_call_score   = bot_calls / len(results) * 40
     agent_call_score = bull_prob / 100 * 60
-    combined_call    = bot_call_score + agent_call_score
-    combined_verdict = "CALL" if combined_call >= 50 else "PUT"
+    combined_verdict = "CALL" if (bot_call_score + agent_call_score) >= 50 else "PUT"
     cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
     combined_conf = round((avg_c * 0.4) + (max(bull_prob, bear_prob) * 0.6))
 
@@ -1174,16 +1407,33 @@ if agent_data:
   </div>
   <div style="font-size:64px;font-weight:900;color:{cvc};letter-spacing:12px;
     line-height:1;text-shadow:0 0 40px {cvc}66;margin-bottom:8px">{cv}</div>
-  <div style="color:{cvc}77;font-size:12px;letter-spacing:4px;margin-bottom:14px">
+  <div style="color:{cvc}77;font-size:12px;letter-spacing:4px;margin-bottom:18px">
     COMBINED SIGNAL &nbsp;·&nbsp; {conf}% CONFIDENCE
   </div>
+  <div style="display:inline-flex;align-items:center;gap:10px;
+    background:{tlc}10;border:1px solid {tlc}40;border-radius:10px;
+    padding:10px 20px;margin-bottom:14px">
+    <div style="text-align:left">
+      <div style="color:{tlc};font-size:9px;letter-spacing:2px;margin-bottom:2px">
+        ⏱ RECOMMENDED HOLD</div>
+      <div style="color:{tlc};font-size:20px;font-weight:900;letter-spacing:4px">
+        {tl_name}</div>
+      <div style="color:{tlc}88;font-size:10px;letter-spacing:1px">{tl_range}</div>
+    </div>
+  </div>
+  {tl_reason_html}
   <div style="display:inline-block;padding:5px 16px;background:#ffffff06;
-    border:1px solid #181830;border-radius:7px;color:#334;font-size:10px">
+    border:1px solid #181830;border-radius:7px;color:#334;font-size:10px;margin-top:8px">
     ⚠ AI analysis only — not financial advice
   </div>
 </div>""".format(
         cvc=cvc, ticker=ticker, bot_calls=bot_calls, bp=bull_prob,
         cv=combined_verdict, conf=combined_conf,
+        tlc=tl_color, tl_name=tl_name, tl_range=tl_range,
+        tl_reason_html=(
+            '<div style="color:#556;font-size:10px;max-width:480px;margin:0 auto 12px;'
+            'line-height:1.6">{}</div>'.format(tl_reason) if tl_reason else ""
+        ),
     ), unsafe_allow_html=True)
 
 with st.expander("🔍 Raw bot response"):
