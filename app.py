@@ -509,10 +509,10 @@ _BULL_AGENT_ROLES = {
     "index":     ["MARKET BREADTH",  "MOMENTUM", "MACRO CATALYST","INDEX FLOW",  "GLOBAL MACRO"],
 }
 _BEAR_AGENT_ROLES = {
-    "stock":     ["VALUATION/RISK", "TECH BREAKDOWN", "HEADWINDS"],
-    "commodity": ["OVERBOUGHT RISK","TECH BREAKDOWN",  "MACRO HEADWIND"],
-    "etf":       ["OVEREXTENSION",  "TECH BREAKDOWN",  "RISK-OFF"],
-    "index":     ["VALUATION RISK", "TECH BREAKDOWN",  "MACRO RISK"],
+    "stock":     ["VALUATION/RISK",  "TECH BREAKDOWN", "HEADWINDS",      "VOLATILITY",    "CONTRARIAN"],
+    "commodity": ["OVERBOUGHT RISK", "TECH BREAKDOWN", "MACRO HEADWIND", "VOL/RISK",      "CONTRARIAN"],
+    "etf":       ["OVEREXTENSION",   "TECH BREAKDOWN", "RISK-OFF",       "VOL/RISK",      "CONTRARIAN"],
+    "index":     ["VALUATION RISK",  "TECH BREAKDOWN", "MACRO RISK",     "VOLATILITY",    "CONTRARIAN"],
 }
 BULL_AGENTS = [
     {"id": "ZEUS",     "color": "#ffd700", "icon": "⚡"},
@@ -525,6 +525,8 @@ BEAR_AGENTS = [
     {"id": "KRONOS",  "color": "#ff4466", "icon": "⏳"},
     {"id": "HADES",   "color": "#c084fc", "icon": "☽"},
     {"id": "NEMESIS", "color": "#ff6b35", "icon": "⚖"},
+    {"id": "TYPHON",  "color": "#ff2244", "icon": "☢"},
+    {"id": "ERIS",    "color": "#dd44cc", "icon": "✦"},
 ]
 
 
@@ -562,16 +564,30 @@ def _asset_type(sym):
 
 def _agent_roles(sym, atype):
     """Return per-agent focus instructions tailored to asset type."""
+    _typhon = {
+        "commodity": "volatility regime and risk events: VIX spikes, liquidity crunches, margin call cascades, or sudden ETF outflows that could crush this commodity",
+        "etf":       "volatility risk: rising VIX, credit spread widening, ETF discount-to-NAV, and systemic risk factors that threaten this fund's holdings",
+        "index":     "systemic volatility: VIX term structure, credit market stress, gamma-squeeze risks, and tail-risk events that could trigger a selloff",
+        "stock":     "volatility and event risk: earnings miss probability, options skew, implied move vs realized, and binary event risk that could gap the stock down",
+    }
+    _eris = {
+        "commodity": "contrarian signals: overcrowded long positioning in futures/ETF, retail FOMO, COT report extremes, or sentiment surveys showing excessive bullishness",
+        "etf":       "contrarian signals: retail crowding, Rydex/sentiment surveys at extremes, fund flow exhaustion, and mean-reversion risk after extended move",
+        "index":     "contrarian signals: AAII sentiment extremes, put/call ratio complacency, margin debt levels, and historical overextension vs prior peaks",
+        "stock":     "contrarian signals: analyst price target consensus too bullish, short interest dropping (crowded longs), insider selling, or retail FOMO exhaustion",
+    }
     if atype == "commodity":
         return {
             "ZEUS":     "physical supply/demand dynamics, global production data, ETF fund flows, and inventory/stockpile levels",
             "HERMES":   "price momentum using the RSI, MACD, and SMA data provided — cite exact numbers",
             "APOLLO":   "macro catalysts: Fed policy / dollar strength / inflation data / geopolitical events driving demand",
-            "ARES":     "unusual options activity on {sym} or related ETFs, put/call ratio, and institutional positioning",
+            "ARES":     "unusual options activity on {sym} or related ETFs, put/call ratio, and institutional positioning".format(sym=sym),
             "POSEIDON": "macro tailwinds: inflation hedge demand, currency debasement, central bank buying, or commodity supercycle",
             "KRONOS":   "overbought technicals, dollar strength risk, rising real yields, and demand destruction scenarios",
             "HADES":    "chart-based breakdown risk using the RSI, MACD hist, and SMA levels from the data provided — cite exact numbers",
             "NEMESIS":  "macro headwinds: Fed tightening, strong dollar, weak industrial demand, or ETF outflows",
+            "TYPHON":   _typhon["commodity"],
+            "ERIS":     _eris["commodity"],
         }
     elif atype == "etf":
         return {
@@ -583,6 +599,8 @@ def _agent_roles(sym, atype):
             "KRONOS":   "overextended valuation, overbought RSI/technicals, and concentration risk in top holdings",
             "HADES":    "chart-based breakdown risk using the RSI, MACD hist, and SMA levels from the data — cite exact numbers",
             "NEMESIS":  "macro headwinds: Fed policy, sector rotation away from holdings, or risk-off sentiment",
+            "TYPHON":   _typhon["etf"],
+            "ERIS":     _eris["etf"],
         }
     elif atype == "index":
         return {
@@ -594,6 +612,8 @@ def _agent_roles(sym, atype):
             "KRONOS":   "valuation stretch (P/E expansion), overbought breadth, and credit market stress signals",
             "HADES":    "technical breakdown risk using RSI, MACD hist, and key SMA support levels — cite exact numbers",
             "NEMESIS":  "macro headwinds: Fed tightening, geopolitical risk, recession signals, or earnings deterioration",
+            "TYPHON":   _typhon["index"],
+            "ERIS":     _eris["index"],
         }
     else:  # stock
         return {
@@ -605,6 +625,8 @@ def _agent_roles(sym, atype):
             "KRONOS":   "valuation metrics (P/E vs peers), debt levels, and margin compression risk",
             "HADES":    "chart-based breakdown risk using the RSI, MACD hist, and SMA levels from the data — cite exact numbers",
             "NEMESIS":  "competitive threats, regulatory risk, macro headwinds, or insider selling signals",
+            "TYPHON":   _typhon["stock"],
+            "ERIS":     _eris["stock"],
         }
 
 
@@ -717,18 +739,21 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks):
         "• APOLLO: {apollo}\n"
         "• ARES: {ares}\n"
         "• POSEIDON: {poseidon}\n\n"
-        "BEAR agents (argue for PUT / price DOWN):\n"
+        "BEAR agents (argue for PUT / price DOWN — 5 agents for balance):\n"
         "• KRONOS: {kronos}\n"
         "• HADES: {hades}\n"
-        "• NEMESIS: {nemesis}\n\n"
+        "• NEMESIS: {nemesis}\n"
+        "• TYPHON: {typhon}\n"
+        "• ERIS: {eris}\n\n"
         "Rules:\n"
-        "- Each agent writes exactly 2 specific sentences, citing actual data numbers.\n"
+        "- 5 bull agents vs 5 bear agents — perfectly balanced debate.\n"
+        "- Each agent writes exactly 2 specific sentences citing real data or known facts for {sym}.\n"
         "- price_target must be realistic relative to current ${px}.\n"
-        "- bull_prob + bear_prob = 100. consensus_target = probability-weighted price target.\n"
+        "- bull_prob + bear_prob = 100. Base this on the strength of arguments, NOT just agent count.\n"
+        "- consensus_target = probability-weighted price target.\n"
         "- final_verdict = CALL if bull_prob > 50, else PUT.\n"
-        "- timeline = consensus hold duration: scalp (0-1 day), short (1-5 days), "
-        "swing (1-4 weeks), or long (1-3 months). Consider Greeks, IV, and signal strength.\n"
-        "- timeline_reason = one sentence explaining WHY that hold duration (reference theta, IV, DTE).\n\n"
+        "- timeline: scalp (0-1 day), short (1-5 days), swing (1-4 weeks), long (1-3 months).\n"
+        "- timeline_reason = one sentence citing theta, IV, DTE, or momentum strength.\n\n"
         "Reply with ONLY this JSON (no markdown, no backticks):\n"
         '{{"agents":{{'
         '"ZEUS":{{"argument":"...","price_target":0.0,"confidence":70}},'
@@ -738,10 +763,12 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks):
         '"POSEIDON":{{"argument":"...","price_target":0.0,"confidence":70}},'
         '"KRONOS":{{"argument":"...","price_target":0.0,"confidence":70}},'
         '"HADES":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"NEMESIS":{{"argument":"...","price_target":0.0,"confidence":70}}'
+        '"NEMESIS":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"TYPHON":{{"argument":"...","price_target":0.0,"confidence":70}},'
+        '"ERIS":{{"argument":"...","price_target":0.0,"confidence":70}}'
         '}},'
-        '"debate":"2 sentences — which side won and the key deciding factor.",'
-        '"bull_prob":60,"bear_prob":40,'
+        '"debate":"2 sentences — which side made the stronger case and the deciding factor.",'
+        '"bull_prob":50,"bear_prob":50,'
         '"consensus_target":0.0,'
         '"verdict":"CALL",'
         '"timeline":"swing",'
@@ -758,6 +785,7 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks):
         zeus=roles["ZEUS"], hermes=roles["HERMES"], apollo=roles["APOLLO"],
         ares=ares_role, poseidon=roles["POSEIDON"],
         kronos=kronos_role, hades=roles["HADES"], nemesis=roles["NEMESIS"],
+        typhon=roles["TYPHON"], eris=roles["ERIS"],
     )
 
 
@@ -810,6 +838,9 @@ if "agent_raw" not in st.session_state:
     st.session_state["agent_raw"] = None
 if "greeks_data" not in st.session_state:
     st.session_state["greeks_data"] = None
+if "watchlist" not in st.session_state:
+    _saved_wl = os.getenv("WATCHLIST", "")
+    st.session_state["watchlist"] = [t.strip() for t in _saved_wl.split(",") if t.strip()]
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -883,6 +914,36 @@ with st.sidebar:
     run_btn = st.button("▶ ANALYZE", use_container_width=True,
                         disabled=not (_active_key and ticker),
                         key="run_btn")
+    st.markdown("---")
+
+    # ── Watchlist ──────────────────────────────────────────────────────────────
+    st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:6px">◈ WATCHLIST</div>', unsafe_allow_html=True)
+    wl_inp = st.text_input("Add ticker to watchlist", placeholder="AAPL  TSLA  SPY...",
+                           label_visibility="collapsed", key="wl_inp").strip().upper()
+    wa, wb = st.columns(2)
+    if wa.button("+ ADD", use_container_width=True, key="wl_add"):
+        if wl_inp and wl_inp not in st.session_state["watchlist"]:
+            st.session_state["watchlist"].append(wl_inp)
+            set_key(_ENV_PATH, "WATCHLIST", ",".join(st.session_state["watchlist"]))
+            st.rerun()
+    if wb.button("CLEAR ALL", use_container_width=True, key="wl_clr"):
+        st.session_state["watchlist"] = []
+        set_key(_ENV_PATH, "WATCHLIST", "")
+        st.rerun()
+
+    if st.session_state["watchlist"]:
+        for _wt in list(st.session_state["watchlist"]):
+            _wca, _wcb = st.columns([3, 1])
+            if _wca.button(_wt, key="wl_sel_" + _wt, use_container_width=True):
+                st.session_state["ticker_inp"] = _wt
+                st.rerun()
+            if _wcb.button("✕", key="wl_rm_" + _wt, use_container_width=True):
+                st.session_state["watchlist"].remove(_wt)
+                set_key(_ENV_PATH, "WATCHLIST", ",".join(st.session_state["watchlist"]))
+                st.rerun()
+    else:
+        st.markdown('<div style="color:#1e1e30;font-size:9px;margin-top:4px">No tickers saved yet.</div>', unsafe_allow_html=True)
+
     st.markdown("---")
     st.markdown('<div style="color:#1e1e30;font-size:9px">⚠ AI only — not financial advice</div>', unsafe_allow_html=True)
 
@@ -1132,11 +1193,262 @@ def _bot_card_html(bot, r):
                      vc=vc, verdict=r["verdict"], tags=tags_html,
                      analysis=r["analysis"], metrics=metrics_html, rev=rev_html, conf=r["confidence"])
 
-# Bot cards — first 4 in 2-column grid
-col_l, col_r = st.columns(2)
-for i in range(4):
-    col = col_l if i % 2 == 0 else col_r
-    col.markdown(_bot_card_html(BOTS[i], results[i]), unsafe_allow_html=True)
+# ── Summary stats (computed once, used across tabs) ───────────────────────────
+calls    = sum(1 for r in results if r["verdict"] == "CALL")
+puts_n   = len(results) - calls
+avg_c    = round(sum(r["confidence"] for r in results) / len(results))
+final_bot = "CALL" if calls >= puts_n else "PUT"
+fc        = "#00ff88" if final_bot == "CALL" else "#ff4466"
+delta_rev = results[3].get("reversal") if len(results) > 3 else None
+
+agent_data  = st.session_state.get("agent_results")
+bull_prob   = int(agent_data.get("bull_prob", 50))   if agent_data else None
+bear_prob   = int(agent_data.get("bear_prob", 50))   if agent_data else None
+agents_raw  = agent_data.get("agents", {})            if agent_data else {}
+debate_txt  = str(agent_data.get("debate", ""))       if agent_data else ""
+ag_verdict  = ("CALL" if str(agent_data.get("verdict","CALL")).upper()=="CALL" else "PUT") if agent_data else None
+consensus_t = float(agent_data.get("consensus_target", 0) or 0)            if agent_data else 0
+tl_raw      = str(agent_data.get("timeline","swing")).lower()               if agent_data else "swing"
+tl_reason   = str(agent_data.get("timeline_reason",""))                     if agent_data else ""
+tl_labels   = {"scalp":("SCALP","0–1 DAY","#ff9500"),"short":("SHORT","1–5 DAYS","#ffd700"),
+               "swing":("SWING","1–4 WEEKS","#00cfff"),"long":("LONG","1–3 MONTHS","#c084fc")}
+tl_key      = next((k for k in tl_labels if k in tl_raw), "swing")
+tl_name, tl_range, tl_color = tl_labels[tl_key]
+
+cur_atype  = _asset_type(ticker)
+bull_roles = _BULL_AGENT_ROLES.get(cur_atype, _BULL_AGENT_ROLES["stock"])
+bear_roles = _BEAR_AGENT_ROLES.get(cur_atype, _BEAR_AGENT_ROLES["stock"])
+
+if agent_data:
+    bull_targets = [float(agents_raw.get(a["id"],{}).get("price_target",0) or 0) for a in BULL_AGENTS]
+    bear_targets = [float(agents_raw.get(a["id"],{}).get("price_target",0) or 0) for a in BEAR_AGENTS]
+    bull_avg = round(sum(t for t in bull_targets if t>0)/max(1,sum(1 for t in bull_targets if t>0)),2)
+    bear_avg = round(sum(t for t in bear_targets if t>0)/max(1,sum(1 for t in bear_targets if t>0)),2)
+    bot_call_score   = calls / len(results) * 50
+    agent_call_score = bull_prob / 100 * 50
+    combined_verdict = "CALL" if (bot_call_score + agent_call_score) >= 50 else "PUT"
+    cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
+    combined_conf = round((avg_c * 0.4) + (max(bull_prob, bear_prob) * 0.6))
+else:
+    bull_avg = bear_avg = 0
+    combined_verdict = final_bot
+    cvc = fc
+    combined_conf = avg_c
+
+# ── Tabs ───────────────────────────────────────────────────────────────────────
+tab_v, tab_b, tab_a = st.tabs(["⚡  VERDICT", "🤖  BOTS", "⚔  AGENTS"])
+
+# ══════════════════ VERDICT TAB ══════════════════
+with tab_v:
+    # Compact bot vote row
+    votes_html = "".join(
+        '<div style="text-align:center;flex:1;min-width:52px">'
+        '<div style="color:{bc};font-size:8px;letter-spacing:1px;margin-bottom:3px">{id}</div>'
+        '<div style="padding:3px 6px;border-radius:8px;background:{vc}14;border:1px solid {vc}33;'
+        'color:{vc};font-size:10px;font-weight:800">{v}</div>'
+        '</div>'.format(bc=b["color"], id=b["id"],
+                        vc="#00ff88" if r["verdict"]=="CALL" else "#ff4466", v=r["verdict"])
+        for b, r in zip(BOTS, results)
+    )
+    st.markdown(
+        '<div style="display:flex;gap:6px;justify-content:center;margin-bottom:12px;flex-wrap:wrap">'
+        + votes_html + '</div>', unsafe_allow_html=True)
+
+    # Main verdict card
+    rev_html = ""
+    if delta_rev and delta_rev != "NONE":
+        rc2 = "#00ff88" if delta_rev=="BULLISH_REVERSAL" else "#ff4466"
+        rl2 = "⚡ BULLISH REVERSAL" if delta_rev=="BULLISH_REVERSAL" else "⚡ BEARISH REVERSAL"
+        rev_html = '<div style="margin-bottom:10px;padding:5px 14px;display:inline-block;background:{c}10;border:1px solid {c}44;border-radius:8px;color:{c};font-size:11px;font-weight:800">{l}</div>'.format(c=rc2,l=rl2)
+
+    st.markdown("""
+<div style="background:linear-gradient(145deg,#07071a,#0c0c22);border:2px solid {cvc};
+  border-radius:14px;padding:22px;text-align:center;box-shadow:0 0 50px {cvc}14;
+  position:relative;overflow:hidden">
+  <div style="position:absolute;inset:0;pointer-events:none;
+    background:radial-gradient(ellipse at 50% 0%,{cvc}08,transparent 65%)"></div>
+  <div style="color:#333;font-size:9px;letter-spacing:3px;margin-bottom:4px">
+    ▸ {label} ◂</div>
+  <div style="color:#444;font-size:9px;margin-bottom:10px">
+    {ticker} &nbsp;·&nbsp; Bots {bc}/5 CALL &nbsp;·&nbsp; {prob_line}
+  </div>
+  {rev}
+  <div style="font-size:60px;font-weight:900;color:{cvc};letter-spacing:10px;
+    line-height:1;text-shadow:0 0 40px {cvc}55;margin-bottom:6px">{cv}</div>
+  <div style="color:{cvc}77;font-size:11px;letter-spacing:3px;margin-bottom:16px">
+    {sig} &nbsp;·&nbsp; {conf}% CONFIDENCE
+  </div>
+  <div style="display:inline-flex;align-items:center;gap:10px;background:{tlc}10;
+    border:1px solid {tlc}40;border-radius:10px;padding:8px 18px;margin-bottom:12px">
+    <div style="text-align:left">
+      <div style="color:{tlc};font-size:8px;letter-spacing:2px">⏱ HOLD RECOMMENDATION</div>
+      <div style="color:{tlc};font-size:18px;font-weight:900;letter-spacing:4px">{tl_name}</div>
+      <div style="color:{tlc}88;font-size:9px">{tl_range}</div>
+    </div>
+  </div>
+  {tl_reason_html}
+</div>""".format(
+        cvc=cvc, ticker=ticker, bc=calls, cv=combined_verdict, conf=combined_conf,
+        label="COMBINED VERDICT — BOTS + AGENTS" if agent_data else "5-BOT CONSENSUS",
+        prob_line="Agents {}% BULL · 50/50 weight".format(bull_prob) if agent_data else "{}/5 CALL".format(calls),
+        sig="COMBINED" if agent_data else ("STRONG" if avg_c>=80 else "MODERATE" if avg_c>=66 else "WEAK"),
+        rev=rev_html,
+        tlc=tl_color, tl_name=tl_name, tl_range=tl_range,
+        tl_reason_html='<div style="color:#556;font-size:10px;max-width:460px;margin:0 auto 10px;line-height:1.6">{}</div>'.format(tl_reason) if tl_reason else "",
+    ), unsafe_allow_html=True)
+
+    # Price targets + prob bar (only if agents ran)
+    if agent_data:
+        st.markdown("""
+<div style="display:flex;gap:10px;margin:12px 0;flex-wrap:wrap">
+  <div style="flex:1;min-width:100px;text-align:center;padding:10px;
+    background:#00ff8808;border:1px solid #00ff8820;border-radius:8px">
+    <div style="color:#556;font-size:8px;margin-bottom:2px">BULL TARGET</div>
+    <div style="color:#00ff88;font-size:16px;font-weight:800;font-family:'Courier New',monospace">${bull}</div>
+  </div>
+  <div style="flex:1;min-width:100px;text-align:center;padding:10px;
+    background:#ffffff06;border:1px solid #ffffff10;border-radius:8px">
+    <div style="color:#556;font-size:8px;margin-bottom:2px">CONSENSUS</div>
+    <div style="color:#e0e0e0;font-size:16px;font-weight:800;font-family:'Courier New',monospace">${cons}</div>
+  </div>
+  <div style="flex:1;min-width:100px;text-align:center;padding:10px;
+    background:#ff440808;border:1px solid #ff440820;border-radius:8px">
+    <div style="color:#556;font-size:8px;margin-bottom:2px">BEAR TARGET</div>
+    <div style="color:#ff4466;font-size:16px;font-weight:800;font-family:'Courier New',monospace">${bear}</div>
+  </div>
+</div>
+<div style="margin-bottom:4px">
+  <div style="color:#334;font-size:8px;margin-bottom:4px">PROBABILITY SPLIT — 5v5 DEBATE</div>
+  <div style="height:16px;border-radius:8px;overflow:hidden;background:#0f0f20;display:flex">
+    <div style="width:{bp}%;background:linear-gradient(90deg,#00ff8844,#00ff88);
+      display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;color:#050510">{bp}% BULL</div>
+    <div style="width:{brp}%;background:linear-gradient(90deg,#ff446644,#ff4466);
+      display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;color:#050510">{brp}% BEAR</div>
+  </div>
+</div>
+{debate_html}""".format(
+            bull=bull_avg, cons=round(consensus_t,2), bear=bear_avg,
+            bp=bull_prob, brp=bear_prob,
+            debate_html='<div style="color:#667;font-size:10px;line-height:1.7;padding:10px;background:#05050f;border-radius:8px;border:1px solid #141428;margin-top:8px">{}</div>'.format(debate_txt) if debate_txt else "",
+        ), unsafe_allow_html=True)
+
+    st.markdown('<div style="text-align:center;color:#1e1e30;font-size:9px;margin-top:8px">⚠ AI analysis only — not financial advice</div>', unsafe_allow_html=True)
+
+# ══════════════════ BOTS TAB ══════════════════
+with tab_b:
+    col_l, col_r = st.columns(2)
+    for i in range(4):
+        col = col_l if i % 2 == 0 else col_r
+        col.markdown(_bot_card_html(BOTS[i], results[i]), unsafe_allow_html=True)
+
+    # ATLAS full-width
+    if len(results) >= 5:
+        atlas_r  = results[4]
+        atlas_bc = "#ffd700"
+        atlas_vc = "#00ff88" if atlas_r["verdict"]=="CALL" else "#ff4466"
+        saved_tf = st.session_state.get("swarm_tf") or {}
+        tf_order = ["3min","5min","15min","30min","1hr","4hr","1day","1wk","1mo"]
+        tf_lbls  = {"3min":"3M","5min":"5M","15min":"15M","30min":"30M","1hr":"1H","4hr":"4H","1day":"1D","1wk":"1W","1mo":"1MO"}
+        def _tfc(b): return "#00ff88" if b=="BULL" else "#ff4466" if b=="BEAR" else "#667"
+        tf_cells = "".join(
+            '<div style="padding:5px 2px;border-radius:5px;background:{bc}14;border:1px solid {bc}30;text-align:center">'
+            '<div style="color:#556;font-size:7px">{lbl}</div>'
+            '<div style="color:{bc};font-size:9px;font-weight:800">{v}</div>'
+            '</div>'.format(lbl=tf_lbls.get(k,k), v=saved_tf.get(k,"N/A"), bc=_tfc(saved_tf.get(k,"N/A")))
+            for k in tf_order
+        )
+        atlas_metrics = "".join(
+            '<div style="margin-bottom:6px">'
+            '<div style="display:flex;justify-content:space-between;font-size:10px;color:#556">'
+            '<span>{lbl}</span><span style="color:{bc}">{val:.0f}</span></div>'
+            '<div style="height:3px;background:#0f0f20;border-radius:2px;overflow:hidden;margin-top:2px">'
+            '<div style="width:{pct:.0f}%;height:100%;background:linear-gradient(90deg,{bc}55,{bc})"></div>'
+            '</div></div>'.format(lbl=m["label"],val=m["value"],bc=atlas_bc,pct=min(100,m["value"]/m["max"]*100))
+            for m in atlas_r["metrics"]
+        )
+        atlas_tags = "".join(
+            '<span style="padding:2px 4px;border-radius:3px;font-size:7px;margin-right:2px;background:{bc}0c;border:1px solid {bc}18;color:{bc}55">{t}</span>'.format(bc=atlas_bc,t=t)
+            for t in BOTS[4]["tags"]
+        )
+        st.markdown("""
+<div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);border:1px solid {bc}40;
+  border-radius:12px;padding:14px;margin-bottom:10px">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+    <div style="width:34px;height:34px;border-radius:8px;background:{bc}18;border:1px solid {bc}30;
+      display:flex;align-items:center;justify-content:center;font-size:16px;color:{bc}">◎</div>
+    <div style="flex:1">
+      <div style="color:{bc};font-weight:800;font-size:12px;letter-spacing:2px">ATLAS</div>
+      <div style="color:{bc}66;font-size:8px">MULTI-TIMEFRAME</div>
+    </div>
+    <div style="padding:2px 10px;border-radius:20px;background:{vc}12;border:1px solid {vc}44;
+      color:{vc};font-weight:800;font-size:11px;letter-spacing:2px">{verdict}</div>
+  </div>
+  <div style="margin-bottom:6px">{tags}</div>
+  <div style="display:grid;grid-template-columns:repeat(9,1fr);gap:4px;margin-bottom:8px">{cells}</div>
+  <div style="background:#05050f;border-radius:7px;padding:10px;border:1px solid #141428;
+    font-size:11px;line-height:1.7;color:#8899b0;margin-bottom:8px">{analysis}</div>
+  {metrics}
+  <div style="display:flex;justify-content:space-between;margin-top:6px">
+    <span style="color:#222;font-size:9px">CONFIDENCE</span>
+    <span style="color:{bc};font-size:11px;font-weight:800">{conf}%</span>
+  </div>
+</div>""".format(bc=atlas_bc,vc=atlas_vc,verdict=atlas_r["verdict"],tags=atlas_tags,
+                 cells=tf_cells,analysis=atlas_r["analysis"],metrics=atlas_metrics,conf=atlas_r["confidence"]),
+                    unsafe_allow_html=True)
+
+# ══════════════════ AGENTS TAB ══════════════════
+with tab_a:
+    if not agent_data:
+        st.markdown('<div style="text-align:center;padding:30px;color:#334;font-size:12px">Run ANALYZE to see the 10-agent debate.</div>', unsafe_allow_html=True)
+    else:
+        def _mini_agent_card(ag_def, side, role_lbl):
+            a   = agents_raw.get(ag_def["id"], {})
+            bc  = ag_def["color"]
+            sc  = "#00ff88" if side=="BULL" else "#ff4466"
+            arg = str(a.get("argument","")).strip()
+            pt  = float(a.get("price_target", 0) or 0)
+            conf= min(94, max(55, int(a.get("confidence", 68))))
+            return """
+<div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);border:1px solid {bc}40;
+  border-radius:10px;padding:11px;margin-bottom:8px">
+  <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+    <span style="font-size:14px;color:{bc}">{icon}</span>
+    <div style="flex:1;min-width:0">
+      <div style="color:{bc};font-weight:800;font-size:11px;letter-spacing:1px">{id}</div>
+      <div style="color:{bc}55;font-size:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{role}</div>
+    </div>
+    <div style="padding:1px 6px;border-radius:8px;background:{sc}12;border:1px solid {sc}33;
+      color:{sc};font-size:8px;font-weight:800;flex-shrink:0">{side}</div>
+  </div>
+  <div style="font-size:9px;line-height:1.6;color:#7788a0;margin-bottom:6px">{arg}</div>
+  <div style="display:flex;justify-content:space-between;font-size:8px">
+    <span style="color:{bc}">TARGET ${pt:.2f}</span>
+    <span style="color:#444">{conf}% conf</span>
+  </div>
+</div>""".format(bc=bc, icon=ag_def["icon"], id=ag_def["id"], role=role_lbl,
+                 sc=sc, side="▲ BULL" if side=="BULL" else "▼ BEAR",
+                 arg=arg, pt=pt, conf=conf)
+
+        st.markdown('<div style="color:#ffd70077;font-size:9px;font-weight:800;letter-spacing:3px;margin-bottom:6px">▲ BULL — 5 AGENTS</div>', unsafe_allow_html=True)
+        ba_cols = st.columns(5)
+        for i, ag in enumerate(BULL_AGENTS):
+            ba_cols[i].markdown(_mini_agent_card(ag, "BULL", bull_roles[i]), unsafe_allow_html=True)
+
+        st.markdown('<div style="color:#ff446677;font-size:9px;font-weight:800;letter-spacing:3px;margin:6px 0">▼ BEAR — 5 AGENTS</div>', unsafe_allow_html=True)
+        be_cols = st.columns(5)
+        for i, ag in enumerate(BEAR_AGENTS):
+            be_cols[i].markdown(_mini_agent_card(ag, "BEAR", bear_roles[i]), unsafe_allow_html=True)
+
+        if debate_txt:
+            st.markdown("""
+<div style="background:#07071a;border:1px solid #1c1c30;border-radius:10px;padding:14px;margin-top:8px">
+  <div style="color:#334;font-size:9px;letter-spacing:2px;margin-bottom:6px">▸ DEBATE OUTCOME</div>
+  <div style="color:#7788a0;font-size:11px;line-height:1.8">{}</div>
+</div>""".format(debate_txt), unsafe_allow_html=True)
+
+with st.expander("🔍 Raw API responses"):
+    st.code(st.session_state.get("swarm_raw",""), language="json")
+    st.code(st.session_state.get("agent_raw",""), language="json")
 
 # ATLAS card — full width with timeframe grid
 if len(results) >= 5:
@@ -1191,253 +1503,3 @@ if len(results) >= 5:
         tags=atlas_tags, tf_cells=tf_cells,
         analysis=atlas_r["analysis"], metrics=atlas_metrics_html, conf=atlas_r["confidence"]
     ), unsafe_allow_html=True)
-
-# Verdict panel
-calls    = sum(1 for r in results if r["verdict"] == "CALL")
-puts     = len(results) - calls
-final    = "CALL" if calls >= puts else "PUT"
-avg_c    = round(sum(r["confidence"] for r in results) / len(results))
-strength = "STRONG" if avg_c >= 80 else "MODERATE" if avg_c >= 66 else "WEAK"
-fc       = "#00ff88" if final == "CALL" else "#ff4466"
-
-delta_rev = results[3].get("reversal") if len(results) > 3 else None
-rev_badge = ""
-if delta_rev and delta_rev != "NONE":
-    rc2 = "#00ff88" if delta_rev == "BULLISH_REVERSAL" else "#ff4466"
-    rl2 = "⚡ BULLISH REVERSAL" if delta_rev == "BULLISH_REVERSAL" else "⚡ BEARISH REVERSAL"
-    rev_badge = ('<div style="margin:0 auto 14px;padding:7px 18px;display:inline-block;'
-                 'background:{c}10;border:1px solid {c}44;border-radius:9px">'
-                 '<span style="color:{c};font-size:13px;font-weight:800;letter-spacing:2px">'
-                 '{l}</span></div>').format(c=rc2, l=rl2)
-
-votes_html = "".join(
-    '<div style="display:flex;flex-direction:column;align-items:center;gap:3px">'
-    '<span style="color:{bc};font-size:9px">{id}</span>'
-    '<span style="padding:2px 9px;border-radius:12px;background:{vc}14;'
-    'border:1px solid {vc}44;color:{vc};font-size:11px;font-weight:800">{v}</span>'
-    '</div>'.format(
-        bc=b["color"], id=b["id"],
-        vc="#00ff88" if r["verdict"] == "CALL" else "#ff4466",
-        v=r["verdict"])
-    for b, r in zip(BOTS, results)
-)
-
-st.markdown("""
-<div style="background:linear-gradient(145deg,#07071a,#0c0c22);
-  border:2px solid {fc};border-radius:14px;padding:26px;text-align:center;
-  box-shadow:0 0 60px {fc}18;position:relative;overflow:hidden;margin-top:4px">
-  <div style="position:absolute;inset:0;pointer-events:none;
-    background:radial-gradient(ellipse at 50% 0%,{fc}08,transparent 65%)"></div>
-  <div style="color:#333;font-size:10px;letter-spacing:3px;margin-bottom:5px">▸ 5-BOT CONSENSUS ◂</div>
-  <div style="color:#444;font-size:10px;margin-bottom:14px">
-    {ticker} &nbsp;·&nbsp; {calls}/5 CALL &nbsp;·&nbsp; {puts}/5 PUT
-  </div>
-  <div style="display:flex;justify-content:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
-    {votes}
-  </div>
-  <div style="font-size:58px;font-weight:900;color:{fc};letter-spacing:12px;
-    line-height:1;text-shadow:0 0 40px {fc}66;margin-bottom:6px">{final}</div>
-  <div style="color:{fc}77;font-size:12px;letter-spacing:4px;margin-bottom:14px">
-    {strength} SIGNAL &nbsp;·&nbsp; {avgc}% CONFIDENCE
-  </div>
-  {rev_badge}
-  <div style="display:inline-block;padding:5px 16px;background:#ffffff06;
-    border:1px solid #181830;border-radius:7px;color:#334;font-size:10px;margin-top:6px">
-    ⚠ AI analysis only — not financial advice
-  </div>
-</div>""".format(
-    fc=fc, ticker=ticker, calls=calls, puts=puts,
-    votes=votes_html, final=final, strength=strength,
-    avgc=avg_c, rev_badge=rev_badge,
-), unsafe_allow_html=True)
-
-# ── 8-Agent Debate ─────────────────────────────────────────────────────────────
-st.markdown("""
-<div style="text-align:center;padding:20px 0 10px">
-  <div style="color:#1e1e30;font-size:9px;letter-spacing:4px;margin-bottom:4px">▸ PROBABILITY-WEIGHTED DEBATE ◂</div>
-  <div style="font-size:20px;font-weight:900;letter-spacing:6px;
-    background:linear-gradient(90deg,#ffd700,#00ff88,#ff4466);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent">
-    ⚡ 8-AGENT DEBATE
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-if st.session_state.get("agent_error"):
-    st.warning("Agent debate error: " + st.session_state["agent_error"])
-
-agent_data = st.session_state.get("agent_results")
-if agent_data:
-    agents_raw = agent_data.get("agents", {})
-    cur_atype  = _asset_type(ticker)
-    bull_roles = _BULL_AGENT_ROLES.get(cur_atype, _BULL_AGENT_ROLES["stock"])
-    bear_roles = _BEAR_AGENT_ROLES.get(cur_atype, _BEAR_AGENT_ROLES["stock"])
-
-    def _agent_card(agent_def, side, role_label):
-        a = agents_raw.get(agent_def["id"], {})
-        bc = agent_def["color"]
-        sc = "#00ff88" if side == "BULL" else "#ff4466"
-        side_lbl = "▲ BULL" if side == "BULL" else "▼ BEAR"
-        arg = str(a.get("argument", "Analysis in progress.")).strip()
-        pt  = a.get("price_target", 0)
-        conf = min(94, max(55, int(a.get("confidence", 68))))
-        pt_html = ('<div style="margin-top:6px;color:{bc};font-size:11px;font-weight:800">'
-                   'TARGET: ${:.2f}</div>'.format(pt, bc=bc)) if pt else ""
-        return """
-<div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);
-  border:1px solid {bc}40;border-radius:12px;padding:14px;margin-bottom:10px">
-  <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px">
-    <div style="width:32px;height:32px;border-radius:8px;background:{bc}18;border:1px solid {bc}30;
-      display:flex;align-items:center;justify-content:center;font-size:16px;color:{bc};flex-shrink:0">{icon}</div>
-    <div style="flex:1">
-      <div style="color:{bc};font-weight:800;font-size:12px;letter-spacing:2px">{id}</div>
-      <div style="color:{bc}66;font-size:8px">{role}</div>
-    </div>
-    <div style="padding:2px 8px;border-radius:12px;background:{sc}12;border:1px solid {sc}44;
-      color:{sc};font-size:9px;font-weight:800">{side}</div>
-  </div>
-  <div style="background:#05050f;border-radius:7px;padding:10px;border:1px solid #141428;
-    font-size:10px;line-height:1.7;color:#8899b0">{arg}</div>
-  {pt}
-  <div style="display:flex;justify-content:space-between;margin-top:7px">
-    <span style="color:#222;font-size:8px">CONFIDENCE</span>
-    <span style="color:{bc};font-size:10px;font-weight:800">{conf}%</span>
-  </div>
-</div>""".format(bc=bc, sc=sc, icon=agent_def["icon"], id=agent_def["id"],
-                 role=role_label, side=side_lbl, arg=arg, pt=pt_html, conf=conf)
-
-    # Bull agents header
-    st.markdown('<div style="color:#ffd70077;font-size:10px;font-weight:800;letter-spacing:3px;margin:8px 0 4px">▲ BULL CASE — 5 AGENTS</div>', unsafe_allow_html=True)
-    bc1, bc2, bc3 = st.columns(3)
-    bull_cols = [bc1, bc2, bc3, bc1, bc2]
-    for i, ag in enumerate(BULL_AGENTS):
-        bull_cols[i].markdown(_agent_card(ag, "BULL", bull_roles[i]), unsafe_allow_html=True)
-
-    # Bear agents header
-    st.markdown('<div style="color:#ff446677;font-size:10px;font-weight:800;letter-spacing:3px;margin:8px 0 4px">▼ BEAR CASE — 3 AGENTS</div>', unsafe_allow_html=True)
-    br1, br2, br3 = st.columns(3)
-    bear_cols = [br1, br2, br3]
-    for i, ag in enumerate(BEAR_AGENTS):
-        bear_cols[i].markdown(_agent_card(ag, "BEAR", bear_roles[i]), unsafe_allow_html=True)
-
-    # Debate summary + probability
-    debate_txt  = str(agent_data.get("debate", "Debate complete."))
-    bull_prob   = int(agent_data.get("bull_prob", 50))
-    bear_prob   = int(agent_data.get("bear_prob", 50))
-    consensus_t = float(agent_data.get("consensus_target", 0) or 0)
-    ag_verdict  = "CALL" if str(agent_data.get("verdict", "CALL")).upper() == "CALL" else "PUT"
-    avc         = "#00ff88" if ag_verdict == "CALL" else "#ff4466"
-
-    # Individual agent targets
-    bull_targets = [float(agents_raw.get(a["id"], {}).get("price_target", 0) or 0) for a in BULL_AGENTS]
-    bear_targets = [float(agents_raw.get(a["id"], {}).get("price_target", 0) or 0) for a in BEAR_AGENTS]
-    bull_avg = round(sum(t for t in bull_targets if t > 0) / max(1, sum(1 for t in bull_targets if t > 0)), 2)
-    bear_avg = round(sum(t for t in bear_targets if t > 0) / max(1, sum(1 for t in bear_targets if t > 0)), 2)
-
-    st.markdown("""
-<div style="background:linear-gradient(145deg,#08081a,#0d0d22);border:1px solid #1c1c30;
-  border-radius:12px;padding:18px;margin:10px 0">
-  <div style="color:#334;font-size:9px;letter-spacing:2px;margin-bottom:8px">▸ DEBATE OUTCOME</div>
-  <div style="color:#8899b0;font-size:11px;line-height:1.8;margin-bottom:14px">{debate}</div>
-  <div style="display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap">
-    <div style="flex:1;min-width:120px;text-align:center;padding:10px;
-      background:#00ff8808;border:1px solid #00ff8820;border-radius:8px">
-      <div style="color:#556;font-size:8px;margin-bottom:3px">BULL TARGET (avg)</div>
-      <div style="color:#00ff88;font-size:18px;font-weight:800;font-family:'Courier New',monospace">
-        ${bull_avg}</div>
-    </div>
-    <div style="flex:1;min-width:120px;text-align:center;padding:10px;
-      background:#ffffff06;border:1px solid #ffffff10;border-radius:8px">
-      <div style="color:#556;font-size:8px;margin-bottom:3px">CONSENSUS TARGET</div>
-      <div style="color:#e0e0e0;font-size:18px;font-weight:800;font-family:'Courier New',monospace">
-        ${consensus}</div>
-    </div>
-    <div style="flex:1;min-width:120px;text-align:center;padding:10px;
-      background:#ff440808;border:1px solid #ff440820;border-radius:8px">
-      <div style="color:#556;font-size:8px;margin-bottom:3px">BEAR TARGET (avg)</div>
-      <div style="color:#ff4466;font-size:18px;font-weight:800;font-family:'Courier New',monospace">
-        ${bear_avg}</div>
-    </div>
-  </div>
-  <div style="color:#334;font-size:8px;margin-bottom:5px">PROBABILITY SPLIT</div>
-  <div style="height:18px;border-radius:9px;overflow:hidden;background:#0f0f20;display:flex">
-    <div style="width:{bp}%;background:linear-gradient(90deg,#00ff8844,#00ff88);
-      display:flex;align-items:center;justify-content:center;
-      font-size:9px;font-weight:800;color:#050510">{bp}% BULL</div>
-    <div style="width:{brp}%;background:linear-gradient(90deg,#ff446644,#ff4466);
-      display:flex;align-items:center;justify-content:center;
-      font-size:9px;font-weight:800;color:#050510">{brp}% BEAR</div>
-  </div>
-</div>""".format(
-        debate=debate_txt, bull_avg=bull_avg, consensus=round(consensus_t, 2), bear_avg=bear_avg,
-        bp=bull_prob, brp=bear_prob,
-    ), unsafe_allow_html=True)
-
-    # Timeline from agents
-    tl_raw    = str(agent_data.get("timeline", "swing")).lower().strip()
-    tl_reason = str(agent_data.get("timeline_reason", "")).strip()
-    tl_labels = {
-        "scalp": ("SCALP", "0 – 1 DAY",     "#ff9500"),
-        "short": ("SHORT", "1 – 5 DAYS",     "#ffd700"),
-        "swing": ("SWING", "1 – 4 WEEKS",    "#00cfff"),
-        "long":  ("LONG",  "1 – 3 MONTHS",   "#c084fc"),
-    }
-    tl_key  = next((k for k in tl_labels if k in tl_raw), "swing")
-    tl_name, tl_range, tl_color = tl_labels[tl_key]
-
-    # Combined verdict (bots 40% + agents 60%)
-    bot_calls = sum(1 for r in results if r["verdict"] == "CALL")
-    bot_call_score   = bot_calls / len(results) * 40
-    agent_call_score = bull_prob / 100 * 60
-    combined_verdict = "CALL" if (bot_call_score + agent_call_score) >= 50 else "PUT"
-    cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
-    combined_conf = round((avg_c * 0.4) + (max(bull_prob, bear_prob) * 0.6))
-
-    st.markdown("""
-<div style="background:linear-gradient(145deg,#07071a,#0c0c22);
-  border:2px solid {cvc};border-radius:14px;padding:26px;text-align:center;
-  box-shadow:0 0 60px {cvc}18;position:relative;overflow:hidden;margin-top:8px">
-  <div style="position:absolute;inset:0;pointer-events:none;
-    background:radial-gradient(ellipse at 50% 0%,{cvc}08,transparent 65%)"></div>
-  <div style="color:#333;font-size:10px;letter-spacing:3px;margin-bottom:5px">
-    ▸ COMBINED VERDICT — BOTS + AGENTS ◂</div>
-  <div style="color:#444;font-size:10px;margin-bottom:10px">
-    {ticker} &nbsp;·&nbsp; Bots {bot_calls}/5 CALL &nbsp;·&nbsp; Agents {bp}% BULL
-    &nbsp;·&nbsp; Weighted 40/60
-  </div>
-  <div style="font-size:64px;font-weight:900;color:{cvc};letter-spacing:12px;
-    line-height:1;text-shadow:0 0 40px {cvc}66;margin-bottom:8px">{cv}</div>
-  <div style="color:{cvc}77;font-size:12px;letter-spacing:4px;margin-bottom:18px">
-    COMBINED SIGNAL &nbsp;·&nbsp; {conf}% CONFIDENCE
-  </div>
-  <div style="display:inline-flex;align-items:center;gap:10px;
-    background:{tlc}10;border:1px solid {tlc}40;border-radius:10px;
-    padding:10px 20px;margin-bottom:14px">
-    <div style="text-align:left">
-      <div style="color:{tlc};font-size:9px;letter-spacing:2px;margin-bottom:2px">
-        ⏱ RECOMMENDED HOLD</div>
-      <div style="color:{tlc};font-size:20px;font-weight:900;letter-spacing:4px">
-        {tl_name}</div>
-      <div style="color:{tlc}88;font-size:10px;letter-spacing:1px">{tl_range}</div>
-    </div>
-  </div>
-  {tl_reason_html}
-  <div style="display:inline-block;padding:5px 16px;background:#ffffff06;
-    border:1px solid #181830;border-radius:7px;color:#334;font-size:10px;margin-top:8px">
-    ⚠ AI analysis only — not financial advice
-  </div>
-</div>""".format(
-        cvc=cvc, ticker=ticker, bot_calls=bot_calls, bp=bull_prob,
-        cv=combined_verdict, conf=combined_conf,
-        tlc=tl_color, tl_name=tl_name, tl_range=tl_range,
-        tl_reason_html=(
-            '<div style="color:#556;font-size:10px;max-width:480px;margin:0 auto 12px;'
-            'line-height:1.6">{}</div>'.format(tl_reason) if tl_reason else ""
-        ),
-    ), unsafe_allow_html=True)
-
-with st.expander("🔍 Raw bot response"):
-    st.code(st.session_state.get("swarm_raw", ""), language="json")
-
-with st.expander("🔍 Raw agent debate response"):
-    st.code(st.session_state.get("agent_raw", ""), language="json")
