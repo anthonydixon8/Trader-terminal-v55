@@ -451,6 +451,75 @@ def _compute_bot_verdicts(d, tf):
     return {"ARIA": aria, "NEXUS": nexus, "SIGMA": sigma, "DELTA": delta, "ATLAS": atlas}
 
 
+def _compute_bot_confidences(d, tf):
+    """Signal-strength-based confidence per bot. No LLM involved."""
+    confs = {}
+    if d:
+        # ARIA — RSI distance from 50 + %B extremity + volume confirmation
+        rsi_dist = abs(d["rsi"] - 50)           # 0 (neutral) → 50 (extreme)
+        pctb_ext = abs(d["pctB"] - 0.5) * 2     # 0 (mid) → 1 (edge)
+        aria_c = 55 + int(rsi_dist * 0.65 + pctb_ext * 14)
+        if d["vol_ratio"] > 1.5:
+            aria_c = min(93, aria_c + 6)         # volume confirms → +6
+        confs["ARIA"] = min(93, max(55, aria_c))
+
+        # NEXUS — how many of 6 signals agree (3=weakest, 6=strongest)
+        px = d["px"]
+        n_bull = sum([
+            px > d["sma7"],
+            px > d["sma20"],
+            (not d.get("sma50"))  or px > d["sma50"],
+            (not d.get("sma200")) or px > d["sma200"],
+            d["ema12"] > d["ema26"],
+            px > d["vwap"],
+        ])
+        alignment = max(n_bull, 6 - n_bull)      # 3 → 6
+        nexus_c = 55 + int((alignment - 3) / 3 * 38)
+        confs["NEXUS"] = min(93, max(55, nexus_c))
+
+        # SIGMA — PCR deviation from 1.0 (neutral) + 52w-position extremes
+        pcr = d.get("pcr")
+        sigma_c = 57 if pcr is None else (55 + min(36, int(abs(pcr - 1.0) * 34)))
+        pos52 = ((px - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
+        if pos52 < 15 or pos52 > 85:
+            sigma_c = min(93, sigma_c + 8)       # extreme 52w position → more confident
+        confs["SIGMA"] = min(93, max(55, sigma_c))
+
+        # DELTA — MACD expansion magnitude + divergence confirmation
+        mh, mhp = d["macd_hist"], d["macd_hist_prev"]
+        expanding = abs(mh) > abs(mhp)
+        exp_ratio = abs(mh) / max(0.0001, abs(mhp)) if expanding else 0.5
+        delta_c = 55 + min(36, int(exp_ratio * 14))
+        if d["rsi_div"] in ("bullish", "bearish"):
+            delta_c = min(93, delta_c + 8)       # divergence confirmed → stronger signal
+        confs["DELTA"] = min(93, max(55, delta_c))
+    else:
+        for b in ["ARIA", "NEXUS", "SIGMA", "DELTA"]:
+            confs[b] = 58
+
+    # ATLAS — how many TFs agree with the majority
+    if tf:
+        bull_tf = sum(1 for v in tf.values() if v == "BULL")
+        bear_tf = sum(1 for v in tf.values() if v == "BEAR")
+        majority = max(bull_tf, bear_tf)
+        atlas_c = 55 + int(majority / 9 * 38)
+    else:
+        atlas_c = 58
+    confs["ATLAS"] = min(93, max(55, atlas_c))
+
+    return confs
+
+
+def _compute_agent_probs(tech_score, bot_calls, n_bots=5):
+    """Compute bull/bear probability from objective signals only. Zero LLM influence."""
+    tech_pct = (tech_score + 5) / 10      # maps -5→0.0, 0→0.5, +5→1.0
+    bot_pct  = bot_calls / n_bots          # fraction of bots voting CALL
+    # 55% weight to tech score, 45% to bot vote
+    bull_raw = tech_pct * 0.55 + bot_pct * 0.45
+    bull_prob = max(10, min(90, round(bull_raw * 100)))
+    return bull_prob, 100 - bull_prob
+
+
 def _compute_timeline(d, og, tech_score):
     """Determine hold duration from options data and signal strength — no LLM."""
     tl_map = {
@@ -575,10 +644,10 @@ def _extract_json(text):
         return None
 
 
-def _parse_bot(bot_id, data, forced_verdict=None):
+def _parse_bot(bot_id, data, forced_verdict=None, forced_confidence=None):
     d          = data.get(bot_id, {})
     verdict    = forced_verdict or ("CALL" if "CALL" in str(d.get("verdict", "")).upper() else "PUT")
-    confidence = min(94, max(55, int(d.get("confidence", 68))))
+    confidence = forced_confidence if forced_confidence is not None else min(93, max(55, int(d.get("confidence", 68))))
     analysis   = str(d.get("analysis", "Analysis complete.")).strip()
     reversal   = None
     if bot_id == "DELTA":
@@ -641,10 +710,13 @@ def run_swarm(sym, api_key, provider, market_data, tf_data):
 
     data = _extract_json(raw)
     if data is None:
-        # LLM failed to return JSON — build minimal stubs so verdicts still show
         data = {}
-    # Step 2: enforce Python-computed verdicts (overrides any LLM verdict drift)
-    return [_parse_bot(b["id"], data, forced_verdict=bot_verdicts.get(b["id"])) for b in BOTS], raw
+    # Step 2: enforce Python-computed verdicts AND confidence scores
+    bot_confs = _compute_bot_confidences(market_data, tf_data)
+    return [_parse_bot(b["id"], data,
+                       forced_verdict=bot_verdicts.get(b["id"]),
+                       forced_confidence=bot_confs.get(b["id"]))
+            for b in BOTS], raw
 
 
 # ── Agent definitions ─────────────────────────────────────────────────────────
@@ -893,34 +965,24 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRA
         "• NEMESIS: {nemesis}\n"
         "• TYPHON: {typhon}\n"
         "• ERIS: {eris}\n\n"
-        "Rules:\n"
-        "- 5 bull agents vs 5 bear agents — perfectly balanced debate.\n"
-        "- Each agent writes exactly 2 specific sentences citing real data or known facts for {sym}.\n"
-        "- price_target must be realistic relative to current ${px}.\n"
-        "- bull_prob + bear_prob = 100. Base this on the strength of arguments, NOT just agent count.\n"
-        "- consensus_target = probability-weighted price target.\n"
-        "- final_verdict = CALL if bull_prob > 50, else PUT.\n"
-        "- timeline: scalp (0-1 day), short (1-5 days), swing (1-4 weeks), long (1-3 months).\n"
-        "- timeline_reason = one sentence citing theta, IV, DTE, or momentum strength.\n\n"
+        "YOUR ONLY JOB: Write the argument text for each agent. Be specific, cite data.\n"
+        "Probability, verdict, and timeline are computed separately from objective data — do NOT include them.\n"
+        "Each agent: 2 sentences max, specific to their domain, citing actual numbers where available.\n"
+        "price_target: realistic price level relative to ${px}. Do NOT default to current price.\n\n"
         "Reply with ONLY this JSON (no markdown, no backticks):\n"
         '{{"agents":{{'
-        '"ZEUS":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"HERMES":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"APOLLO":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"ARES":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"POSEIDON":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"KRONOS":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"HADES":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"NEMESIS":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"TYPHON":{{"argument":"...","price_target":0.0,"confidence":70}},'
-        '"ERIS":{{"argument":"...","price_target":0.0,"confidence":70}}'
+        '"ZEUS":{{"argument":"...","price_target":0.0}},'
+        '"HERMES":{{"argument":"...","price_target":0.0}},'
+        '"APOLLO":{{"argument":"...","price_target":0.0}},'
+        '"ARES":{{"argument":"...","price_target":0.0}},'
+        '"POSEIDON":{{"argument":"...","price_target":0.0}},'
+        '"KRONOS":{{"argument":"...","price_target":0.0}},'
+        '"HADES":{{"argument":"...","price_target":0.0}},'
+        '"NEMESIS":{{"argument":"...","price_target":0.0}},'
+        '"TYPHON":{{"argument":"...","price_target":0.0}},'
+        '"ERIS":{{"argument":"...","price_target":0.0}}'
         '}},'
-        '"debate":"2 sentences — which side made the stronger case and the deciding factor.",'
-        '"bull_prob":50,"bear_prob":50,'
-        '"consensus_target":0.0,'
-        '"verdict":"CALL",'
-        '"timeline":"swing",'
-        '"timeline_reason":"..."}}'
+        '"debate":"2 sentences on which domain had the strongest case and why."}}'
     ).format(
         sym=sym, asset_label=asset_label,
         data=data_s, tf=tf_s, bots=bot_summary, px=px,
@@ -1362,15 +1424,15 @@ final_bot = "CALL" if calls >= puts_n else "PUT"
 fc        = "#00ff88" if final_bot == "CALL" else "#ff4466"
 delta_rev = results[3].get("reversal") if len(results) > 3 else None
 
-agent_data  = st.session_state.get("agent_results")
-bull_prob   = int(agent_data.get("bull_prob", 50))   if agent_data else None
-bear_prob   = int(agent_data.get("bear_prob", 50))   if agent_data else None
-agents_raw  = agent_data.get("agents", {})            if agent_data else {}
-debate_txt  = str(agent_data.get("debate", ""))       if agent_data else ""
-consensus_t = float(agent_data.get("consensus_target", 0) or 0)            if agent_data else 0
+agent_data = st.session_state.get("agent_results")
+agents_raw = agent_data.get("agents", {}) if agent_data else {}
+debate_txt = str(agent_data.get("debate", "")) if agent_data else ""
 
-# Timeline: computed deterministically from data — not from LLM
-_ts_now  = _tech_score(md, tf)
+# All numerical outputs computed from objective data — zero LLM influence
+_ts_now = _tech_score(md, tf)
+bull_prob, bear_prob = _compute_agent_probs(_ts_now, calls, len(results))
+
+# Timeline: deterministic from data
 _tl_key, (_tl_name, _tl_range, _tl_color) = _compute_timeline(md, og, _ts_now)
 tl_name, tl_range, tl_color = _tl_name, _tl_range, _tl_color
 
@@ -1383,20 +1445,26 @@ if agent_data:
     bear_targets = [float(agents_raw.get(a["id"],{}).get("price_target",0) or 0) for a in BEAR_AGENTS]
     bull_avg = round(sum(t for t in bull_targets if t>0)/max(1,sum(1 for t in bull_targets if t>0)),2)
     bear_avg = round(sum(t for t in bear_targets if t>0)/max(1,sum(1 for t in bear_targets if t>0)),2)
-    # Weighted: 30% pure tech, 35% bots, 35% agents — tech score can override LLM bias
-    tech_call_pct    = (_ts_now + 5) / 10          # 0.0 (strongly bear) → 1.0 (strongly bull)
-    bot_call_pct     = calls / len(results)
-    agent_call_pct   = bull_prob / 100
-    combined_score   = tech_call_pct * 30 + bot_call_pct * 35 + agent_call_pct * 35
-    combined_verdict = "CALL" if combined_score >= 50 else "PUT"
-    cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
-    combined_conf = round((avg_c * 0.35) + (max(bull_prob, bear_prob) * 0.35) + (abs(_ts_now) / 5 * 100 * 0.30))
-    combined_conf = min(94, max(55, combined_conf))
+    # Consensus target = prob-weighted average of all 10 agent price targets
+    all_targets = [(t, True) for t in bull_targets] + [(t, False) for t in bear_targets]
+    w_bull = bull_prob / 100
+    w_bear = bear_prob / 100
+    w_sum = sum((w_bull if is_b else w_bear) for t, is_b in all_targets if t > 0)
+    consensus_t = round(
+        sum(t * (w_bull if is_b else w_bear) for t, is_b in all_targets if t > 0) / max(0.001, w_sum), 2
+    ) if w_sum > 0 else 0
 else:
     bull_avg = bear_avg = 0
-    combined_verdict = final_bot
-    cvc = fc
-    combined_conf = avg_c
+    consensus_t = 0
+
+# Combined verdict = 55% tech + 45% bot consensus (fully objective, no LLM)
+tech_call_pct = (_ts_now + 5) / 10
+bot_call_pct  = calls / len(results)
+combined_score = tech_call_pct * 55 + bot_call_pct * 45
+combined_verdict = "CALL" if combined_score >= 50 else "PUT"
+cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
+# Confidence = how far from 50 the score is (stronger signal = higher conf)
+combined_conf = min(93, max(55, 55 + int(abs(combined_score - 50) * 0.76)))
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab_v, tab_b, tab_a = st.tabs(["⚡  VERDICT", "🤖  BOTS", "⚔  AGENTS"])
