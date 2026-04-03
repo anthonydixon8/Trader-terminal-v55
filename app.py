@@ -906,6 +906,9 @@ with st.sidebar:
             st.markdown('<div style="color:#ff446677;font-size:9px;margin-top:4px">○ No key set</div>', unsafe_allow_html=True)
 
     st.markdown("---")
+    # Apply watchlist selection before ticker widget renders
+    if "pending_ticker" in st.session_state:
+        st.session_state["ticker_inp"] = st.session_state.pop("pending_ticker")
     st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:4px">TICKER SYMBOL</div>', unsafe_allow_html=True)
     ticker = st.text_input("Ticker", placeholder="AAPL  TSLA  SPY...",
                            label_visibility="collapsed", key="ticker_inp").strip().upper()
@@ -935,7 +938,7 @@ with st.sidebar:
         for _wt in list(st.session_state["watchlist"]):
             _wca, _wcb = st.columns([3, 1])
             if _wca.button(_wt, key="wl_sel_" + _wt, use_container_width=True):
-                st.session_state["ticker_inp"] = _wt
+                st.session_state["pending_ticker"] = _wt
                 st.rerun()
             if _wcb.button("✕", key="wl_rm_" + _wt, use_container_width=True):
                 st.session_state["watchlist"].remove(_wt)
