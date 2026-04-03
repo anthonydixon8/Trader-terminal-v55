@@ -338,8 +338,155 @@ def fetch_tf_data(sym):
     return out
 
 
-def _build_prompt(sym, d, tf):
-    """Build Claude prompt. d=market data dict or None. tf=timeframe bias dict or None."""
+# ── Deterministic bot logic ───────────────────────────────────────────────────
+def _tech_score(d, tf):
+    """Return integer -5 (strongly bearish) to +5 (strongly bullish)."""
+    if not d:
+        return 0
+    s = 0
+    rsi = d["rsi"]
+    if rsi > 70:   s -= 2
+    elif rsi > 60: s -= 1
+    elif rsi < 30: s += 2
+    elif rsi < 40: s += 1
+
+    px = d["px"]
+    if px < d["sma7"] and px < d["sma20"]:  s -= 2
+    elif px > d["sma7"] and px > d["sma20"]: s += 2
+    if d.get("sma50")  and px < d["sma50"]:  s -= 1
+    if d.get("sma200") and px < d["sma200"]: s -= 1
+    if d.get("sma50")  and px > d["sma50"]:  s += 1
+    if d.get("sma200") and px > d["sma200"]: s += 1
+
+    mh, mhp = d["macd_hist"], d["macd_hist_prev"]
+    if mh < 0 and abs(mh) > abs(mhp): s -= 2   # neg expanding
+    elif mh > 0 and mh > mhp:         s += 2   # pos expanding
+    elif mh < 0:                       s -= 1
+    else:                              s += 1
+
+    if d["ema12"] < d["ema26"]: s -= 1
+    else:                        s += 1
+
+    pos52 = ((px - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
+    if pos52 > 80: s -= 1
+    elif pos52 < 20: s += 1
+
+    if tf:
+        bull_tf = sum(1 for v in tf.values() if v == "BULL")
+        bear_tf = sum(1 for v in tf.values() if v == "BEAR")
+        if bear_tf >= 6:   s -= 2
+        elif bull_tf >= 6: s += 2
+        elif bear_tf > bull_tf: s -= 1
+        elif bull_tf > bear_tf: s += 1
+
+    return max(-5, min(5, s))
+
+
+def _compute_bot_verdicts(d, tf):
+    """Compute each bot's CALL/PUT strictly from indicator thresholds."""
+    if not d:
+        return {b["id"]: "CALL" for b in BOTS}
+
+    px = d["px"]
+    pos52 = ((px - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
+
+    # ARIA — RSI + Bollinger + Volume
+    if d["rsi"] < 35 or d["pctB"] < 0.15:
+        aria = "CALL"
+    elif d["rsi"] > 65 or d["pctB"] > 0.85:
+        aria = "PUT"
+    elif d["vol_ratio"] > 1.5:
+        aria = "CALL" if d["chg"] > 0 else "PUT"
+    else:
+        aria = "CALL" if d["rsi"] > 52 else "PUT"
+
+    # NEXUS — SMA/EMA/VWAP alignment
+    sma50_ok  = d.get("sma50")  is not None
+    sma200_ok = d.get("sma200") is not None
+    bull_sig = sum([
+        px > d["sma7"],
+        px > d["sma20"],
+        (not sma50_ok)  or px > d["sma50"],
+        (not sma200_ok) or px > d["sma200"],
+        d["ema12"] > d["ema26"],
+        px > d["vwap"],
+    ])
+    nexus = "CALL" if bull_sig >= 4 else "PUT"
+
+    # SIGMA — PCR + 52w position
+    sig = 0
+    pcr = d.get("pcr")
+    if pcr is not None:
+        if pcr > 1.2:   sig -= 2
+        elif pcr > 0.9: sig -= 1
+        elif pcr < 0.7: sig += 2
+        else:           sig += 1
+    if pos52 < 20:   sig += 1
+    elif pos52 > 80: sig -= 1
+    sigma = "PUT" if sig < 0 else "CALL"
+
+    # DELTA — MACD histogram direction + RSI divergence
+    mh, mhp = d["macd_hist"], d["macd_hist_prev"]
+    neg_exp = mh < 0 and abs(mh) > abs(mhp)
+    pos_exp = mh > 0 and mh > mhp
+    if neg_exp:
+        delta = "PUT"
+    elif pos_exp:
+        delta = "CALL"
+    elif d["rsi_div"] == "bullish":
+        delta = "CALL"
+    elif d["rsi_div"] == "bearish":
+        delta = "PUT"
+    else:
+        delta = "PUT" if mh < 0 else "CALL"
+
+    # ATLAS — multi-timeframe majority
+    if tf:
+        bull_tf = sum(1 for v in tf.values() if v == "BULL")
+        bear_tf = sum(1 for v in tf.values() if v == "BEAR")
+        atlas = "CALL" if bull_tf > bear_tf else "PUT"
+    else:
+        atlas = "CALL" if d["chg"] > 0 else "PUT"
+
+    return {"ARIA": aria, "NEXUS": nexus, "SIGMA": sigma, "DELTA": delta, "ATLAS": atlas}
+
+
+def _compute_timeline(d, og, tech_score):
+    """Determine hold duration from options data and signal strength — no LLM."""
+    tl_map = {
+        "scalp": ("SCALP", "0 – 1 DAY",     "#ff9500"),
+        "short": ("SHORT", "1 – 5 DAYS",     "#ffd700"),
+        "swing": ("SWING", "1 – 4 WEEKS",    "#00cfff"),
+        "long":  ("LONG",  "1 – 3 MONTHS",   "#c084fc"),
+    }
+    key = "swing"
+    if og:
+        dte    = og["days_out"]
+        avg_iv = og["avg_iv"]
+        if dte <= 3:
+            key = "scalp"
+        elif dte <= 7:
+            key = "short"
+        elif avg_iv > 65:
+            key = "short"   # expensive IV — exit quickly
+        elif avg_iv < 22:
+            key = "long"    # cheap IV — hold through the move
+        elif abs(tech_score) >= 4:
+            key = "short"   # very strong signal — momentum play
+        else:
+            key = "swing"
+    else:
+        if abs(tech_score) >= 4:
+            key = "short"
+        elif abs(tech_score) <= 1:
+            key = "swing"
+        else:
+            key = "swing"
+    return key, tl_map[key]
+
+
+def _build_prompt(sym, d, tf, bot_verdicts):
+    """Build LLM prompt — verdicts are PRE-COMPUTED; LLM writes analysis text only."""
     ab = lambda px, ref: "above" if ref and px > ref else "below" if ref else "N/A"
 
     if d:
@@ -349,75 +496,72 @@ def _build_prompt(sym, d, tf):
         pos52 = ((d["px"] - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
         data_block = (
             "LIVE MARKET DATA FOR {sym}:\n"
-            "  Price: ${px} ({sign}{chg}%)  52wH/L: ${h52}/${l52}\n"
+            "  Price: ${px} ({sign}{chg}%)  52wH/L: ${h52}/${l52}  52w-pos: {pos:.0f}%\n"
             "  Volume: {vol:,} ({vr:.1f}x avg)\n\n"
-            "ARIA  — RSI-14: {rsi} ({rsi_lbl})  %B: {pctB:.3f}  Vol: {vr:.1f}x\n"
-            "NEXUS — SMA7: ${sma7} ({rel7})  SMA20: ${sma20} ({rel20})  SMA50: {sma50} ({rel50})\n"
-            "        SMA200: {sma200} ({rel200})  EMA12/26: ${ema12}/${ema26} ({ecross})\n"
-            "        VWAP: ${vwap} ({relvwap})\n"
-            "SIGMA — Put/Call: {pcr}  52w pos: {pos:.0f}%\n"
-            "DELTA — MACD line: {ml}  Signal: {ms}  Hist: {mh} ({mdir})  RSI div: {rdiv}\n"
+            "ARIA  — RSI-14: {rsi}  %B: {pctB:.3f}  Vol: {vr:.1f}x\n"
+            "NEXUS — SMA7: ${sma7} ({rel7})  SMA20: ${sma20} ({rel20})"
+            "  SMA50: {sma50} ({rel50})  SMA200: {sma200} ({rel200})\n"
+            "        EMA12: ${ema12}  EMA26: ${ema26} ({ecross})  VWAP: ${vwap} ({relvwap})\n"
+            "SIGMA — Put/Call Ratio: {pcr}  52w pos: {pos:.0f}%\n"
+            "DELTA — MACD hist: {mh} ({mdir})  RSI-div: {rdiv}\n"
         ).format(
             sym=sym, px=d["px"], sign="+" if d["chg"] >= 0 else "", chg=d["chg"],
             h52=d["high_52"], l52=d["low_52"], vol=d["volume"], vr=d["vol_ratio"],
-            rsi=d["rsi"], rsi_lbl="oversold" if d["rsi"] < 30 else "overbought" if d["rsi"] > 70 else "neutral",
-            pctB=d["pctB"],
-            sma7=d["sma7"], rel7=ab(d["px"], d["sma7"]),
+            pos=pos52, rsi=d["rsi"], pctB=d["pctB"],
+            sma7=d["sma7"],   rel7=ab(d["px"], d["sma7"]),
             sma20=d["sma20"], rel20=ab(d["px"], d["sma20"]),
-            sma50=sma50_txt, rel50=ab(d["px"], d["sma50"]),
-            sma200=sma200_txt, rel200=ab(d["px"], d["sma200"]),
+            sma50=sma50_txt,  rel50=ab(d["px"], d["sma50"]),
+            sma200=sma200_txt,rel200=ab(d["px"], d["sma200"]),
             ema12=d["ema12"], ema26=d["ema26"],
             ecross="bullish" if d["ema12"] > d["ema26"] else "bearish",
-            vwap=d["vwap"], relvwap=ab(d["px"], d["vwap"]),
-            pcr=pcr_txt, pos=pos52,
-            ml=d["macd_line"], ms=d["macd_sig"], mh=d["macd_hist"],
+            vwap=d["vwap"],   relvwap=ab(d["px"], d["vwap"]),
+            pcr=pcr_txt, mh=d["macd_hist"],
             mdir="expanding" if abs(d["macd_hist"]) > abs(d["macd_hist_prev"]) else "contracting",
             rdiv=d["rsi_div"],
         )
     else:
-        data_block = "NOTE: Live data unavailable. Use your knowledge of {} to estimate all analysis.\n".format(sym)
+        data_block = "Live data unavailable. Use your knowledge of {} to estimate.\n".format(sym)
 
-    tf_block = "ATLAS — MULTI-TIMEFRAME BIAS:\n"
+    tf_block = "ATLAS — MULTI-TIMEFRAME:\n  "
     if tf:
-        tf_block += "  " + "  ".join("{}: {}".format(k, v) for k, v in tf.items()) + "\n"
+        bull_tf = sum(1 for v in tf.values() if v == "BULL")
+        bear_tf = sum(1 for v in tf.values() if v == "BEAR")
+        tf_block += "  ".join("{}: {}".format(k, v) for k, v in tf.items())
+        tf_block += "  ({} BULL / {} BEAR)\n".format(bull_tf, bear_tf)
     else:
-        tf_block += "  Live TF data unavailable — estimate based on your knowledge.\n"
+        tf_block += "Unavailable.\n"
 
+    vd = bot_verdicts
     return (
-        "Analyze {sym}. Use the data below. "
-        "Reply with ONLY this JSON (no markdown, no backticks):\n"
-        '{{"ARIA":{{"verdict":"CALL","confidence":72,'
-        '"analysis":"Two specific sentences about {sym} momentum/RSI/volume.",'
-        '"rsi":58,"vol":112,"mom":65}},'
-        '"NEXUS":{{"verdict":"CALL","confidence":74,'
-        '"analysis":"Two specific sentences about {sym} SMA7/20/50/200 and trend.",'
-        '"sma7":62,"sma":68,"ema":72,"trend":70}},'
-        '"SIGMA":{{"verdict":"PUT","confidence":69,'
-        '"analysis":"Two specific sentences about {sym} options/sentiment.",'
-        '"pcr":62,"ivr":45,"flow":55}},'
-        '"DELTA":{{"verdict":"PUT","confidence":76,"rev":"NONE",'
-        '"analysis":"Two specific sentences about {sym} MACD/RSI divergence.",'
-        '"macd":65,"rsid":58,"cvd":60}},'
-        '"ATLAS":{{"verdict":"CALL","confidence":78,'
-        '"analysis":"Two sentences summarizing {sym} multi-timeframe alignment.",'
-        '"short_tf":65,"mid_tf":70,"long_tf":80,"bull_count":6}}}}\n'
-        "STRICT INDEPENDENT RULES — each bot uses ONLY its own indicators, not the others:\n"
-        "• ARIA: RSI>70 → lean PUT (overbought). RSI<30 → lean CALL (oversold). "
-        "%B>0.85 → PUT. %B<0.15 → CALL. vol_ratio>2 amplifies the RSI signal.\n"
-        "• NEXUS: px<sma7 AND px<sma20 → lean PUT. "
-        "px>sma7 AND px>sma20 AND (px>sma50 or sma50 unavailable) → lean CALL. "
-        "ema12<ema26 (bearish EMA cross) → PUT lean. px below VWAP → PUT lean.\n"
-        "• SIGMA: pcr>1.2 → lean PUT (heavy puts). pcr<0.7 → lean CALL (bullish flow). "
-        "52w pos<20% → CALL lean (deep value). 52w pos>80% → PUT lean (extended).\n"
-        "• DELTA: macd_hist<0 AND |hist|>|hist_prev| (neg expanding) → PUT. "
-        "rsi_div=bullish → CALL lean. macd_hist>0 AND |hist|>|hist_prev| (pos expanding) → CALL.\n"
-        "• ATLAS: bull_count>=6 → CALL. bull_count<=3 → PUT. Must match the TF data exactly.\n"
-        "• BOTS MUST DISAGREE when signals conflict — NEVER default all to the same verdict.\n"
-        "• DELTA rev = BULLISH_REVERSAL, BEARISH_REVERSAL, or NONE.\n"
-        "• ATLAS bull_count = exact count of timeframes showing BULL (0-9).\n"
-        "• Confidence 55-94. Metric scores 0-100 (vol up to 150). Use EXACT data numbers.\n\n"
-        "{data}\n{tf}"
-    ).format(sym=sym, data=data_block, tf=tf_block)
+        "Write analysis text for 5 trading bots analyzing {sym}.\n\n"
+        "IMPORTANT: The verdicts below are FINAL and computed from hard indicator thresholds.\n"
+        "DO NOT change any verdict. Your ONLY job is to write 2 sentences explaining WHY\n"
+        "each bot reached its verdict, citing the specific numbers from the data below.\n\n"
+        "FIXED VERDICTS:\n"
+        "  ARIA={aria}  NEXUS={nexus}  SIGMA={sigma}  DELTA={delta}  ATLAS={atlas}\n\n"
+        "{data}\n{tf}\n"
+        "Reply with ONLY this JSON (no markdown):\n"
+        '{{"ARIA":{{"verdict":"{aria}","confidence":72,'
+        '"analysis":"2 sentences about {sym} RSI/Bollinger/volume explaining the {aria} verdict.",'
+        '"rsi":55,"vol":80,"mom":60}},'
+        '"NEXUS":{{"verdict":"{nexus}","confidence":70,'
+        '"analysis":"2 sentences about {sym} SMA/EMA/VWAP alignment explaining the {nexus} verdict.",'
+        '"sma7":55,"ema":60,"trend":58}},'
+        '"SIGMA":{{"verdict":"{sigma}","confidence":68,'
+        '"analysis":"2 sentences about {sym} options sentiment/PCR explaining the {sigma} verdict.",'
+        '"pcr":55,"ivr":50,"flow":52}},'
+        '"DELTA":{{"verdict":"{delta}","confidence":74,"rev":"NONE",'
+        '"analysis":"2 sentences about {sym} MACD/divergence explaining the {delta} verdict.",'
+        '"macd":60,"rsid":55,"cvd":58}},'
+        '"ATLAS":{{"verdict":"{atlas}","confidence":71,'
+        '"analysis":"2 sentences about {sym} multi-timeframe bias explaining the {atlas} verdict.",'
+        '"short_tf":55,"mid_tf":60,"long_tf":58,"bull_count":{bull_count}}}}}'
+    ).format(
+        sym=sym, data=data_block, tf=tf_block,
+        aria=vd["ARIA"], nexus=vd["NEXUS"], sigma=vd["SIGMA"],
+        delta=vd["DELTA"], atlas=vd["ATLAS"],
+        bull_count=(sum(1 for v in tf.values() if v == "BULL") if tf else 4),
+    )
 
 
 def _extract_json(text):
@@ -431,9 +575,9 @@ def _extract_json(text):
         return None
 
 
-def _parse_bot(bot_id, data):
-    d = data.get(bot_id, {})
-    verdict    = "CALL" if "CALL" in str(d.get("verdict", "")).upper() else "PUT"
+def _parse_bot(bot_id, data, forced_verdict=None):
+    d          = data.get(bot_id, {})
+    verdict    = forced_verdict or ("CALL" if "CALL" in str(d.get("verdict", "")).upper() else "PUT")
     confidence = min(94, max(55, int(d.get("confidence", 68))))
     analysis   = str(d.get("analysis", "Analysis complete.")).strip()
     reversal   = None
@@ -444,7 +588,7 @@ def _parse_bot(bot_id, data):
         "ARIA":  [("RSI-14",       d.get("rsi",  55), 100),
                   ("Volume %",     d.get("vol",  55), 150),
                   ("Momentum",     d.get("mom",  55), 100)],
-        "NEXUS": [("SMA 7/20 Score",d.get("sma7", 55), 100),
+        "NEXUS": [("SMA 7/20",     d.get("sma7", 55), 100),
                   ("EMA Strength", d.get("ema",  55), 100),
                   ("Trend Align",  d.get("trend",55), 100)],
         "SIGMA": [("Put/Call",     d.get("pcr",  55), 100),
@@ -457,17 +601,17 @@ def _parse_bot(bot_id, data):
                   ("Mid TF",       d.get("mid_tf",   55), 100),
                   ("Long TF",      d.get("long_tf",  55), 100)],
     }
-    metrics = [{"label": lbl,
-                "value": min(mx, max(0, float(v or 55))),
-                "max": mx}
+    metrics = [{"label": lbl, "value": min(mx, max(0, float(v or 55))), "max": mx}
                for lbl, v, mx in metrics_map.get(bot_id, [])]
     return {"verdict": verdict, "confidence": confidence,
             "analysis": analysis, "metrics": metrics, "reversal": reversal}
 
 
 def run_swarm(sym, api_key, provider, market_data, tf_data):
-    prompt = _build_prompt(sym, market_data, tf_data)
-    system = "You are a stock analysis API. Output ONLY a raw JSON object. No markdown. No explanation. Just JSON."
+    # Step 1: compute verdicts from pure Python thresholds
+    bot_verdicts = _compute_bot_verdicts(market_data, tf_data)
+    prompt = _build_prompt(sym, market_data, tf_data, bot_verdicts)
+    system = "You are a stock analysis API. Output ONLY a raw JSON object. No markdown. No explanation."
 
     if provider == "groq":
         r = requests.post(
@@ -497,8 +641,10 @@ def run_swarm(sym, api_key, provider, market_data, tf_data):
 
     data = _extract_json(raw)
     if data is None:
-        raise ValueError("Could not parse JSON: " + raw[:200])
-    return [_parse_bot(b["id"], data) for b in BOTS], raw
+        # LLM failed to return JSON — build minimal stubs so verdicts still show
+        data = {}
+    # Step 2: enforce Python-computed verdicts (overrides any LLM verdict drift)
+    return [_parse_bot(b["id"], data, forced_verdict=bot_verdicts.get(b["id"])) for b in BOTS], raw
 
 
 # ── Agent definitions ─────────────────────────────────────────────────────────
@@ -630,7 +776,7 @@ def _agent_roles(sym, atype):
         }
 
 
-def _build_agent_prompt(sym, d, tf, bot_results, greeks):
+def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRAL (0/5)"):
     atype = _asset_type(sym)
     asset_label = {"commodity": "commodity/metal ETF", "etf": "broad ETF/fund",
                    "index": "market index", "stock": "individual stock"}.get(atype, "asset")
@@ -725,12 +871,14 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks):
     ) if greeks else roles["KRONOS"]
 
     return (
-        "{sym} is a {asset_label}. 8 AI agents debate CALL (price UP) vs PUT (price DOWN).\n\n"
+        "{sym} is a {asset_label}. 10 AI agents debate CALL (price UP) vs PUT (price DOWN).\n\n"
+        "OBJECTIVE TECHNICAL ASSESSMENT: {tech_bias}\n"
+        "The debate outcome MUST be consistent with this technical reality.\n"
+        "Bears should win if the score is negative. Bulls if positive. Do NOT override this with bias.\n\n"
         "MARKET DATA:\n{data}\n"
         "Timeframes: {tf}\n"
-        "Technical bots voted: {bots}\n\n"
+        "Technical bots (Python-computed, unbiased): {bots}\n\n"
         "OPTIONS & GREEKS DATA:\n{greeks}\n\n"
-        "Suggested hold timeline based on options structure: {tl_hint}\n\n"
         "CRITICAL: {sym} is a {asset_label}. Arguments must be appropriate to this asset class.\n"
         "{no_earnings_note}\n\n"
         "BULL agents (argue for CALL / price UP):\n"
@@ -776,7 +924,7 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks):
     ).format(
         sym=sym, asset_label=asset_label,
         data=data_s, tf=tf_s, bots=bot_summary, px=px,
-        greeks=greeks_s, tl_hint=tl_hint,
+        greeks=greeks_s, tech_bias=tech_bias_label,
         no_earnings_note=(
             "DO NOT mention company earnings, revenue, or P/E ratios — {sym} is NOT a company stock.".format(sym=sym)
             if atype in ("commodity", "etf", "index") else
@@ -789,8 +937,16 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks):
     )
 
 
-def run_agents(sym, api_key, provider, market_data, tf_data, bot_results, greeks=None):
-    prompt = _build_agent_prompt(sym, market_data, tf_data, bot_results, greeks)
+def run_agents(sym, api_key, provider, market_data, tf_data, bot_results, greeks=None, tech_score=0):
+    ts_label = (
+        "STRONGLY BEARISH ({}/5) — bear agents have a significant edge".format(tech_score) if tech_score <= -3 else
+        "MODERATELY BEARISH ({}/5) — bears have a slight edge".format(tech_score)           if tech_score <= -1 else
+        "NEUTRAL ({}/5) — debate should be close".format(tech_score)                        if tech_score == 0  else
+        "MODERATELY BULLISH ({}/5) — bulls have a slight edge".format(tech_score)           if tech_score <= 2  else
+        "STRONGLY BULLISH ({}/5) — bull agents have a significant edge".format(tech_score)
+    )
+    prompt = _build_agent_prompt(sym, market_data, tf_data, bot_results, greeks,
+                                 tech_bias_label=ts_label)
     system = "You are a multi-agent financial debate API. Output ONLY raw JSON. No markdown, no explanation, no backticks."
 
     if provider == "groq":
@@ -1130,9 +1286,11 @@ if run_btn:
     if st.session_state.get("swarm_results"):
         with st.spinner("⚡ Launching 8-agent debate on {}...".format(ticker)):
             try:
+                _ts = _tech_score(md, tf)
                 agent_data, agent_raw = run_agents(
                     ticker, _active_key, st.session_state["provider"],
-                    md, tf, st.session_state["swarm_results"], og
+                    md, tf, st.session_state["swarm_results"], og,
+                    tech_score=_ts,
                 )
                 st.session_state["greeks_data"] = og
                 st.session_state["agent_results"] = agent_data
@@ -1209,14 +1367,12 @@ bull_prob   = int(agent_data.get("bull_prob", 50))   if agent_data else None
 bear_prob   = int(agent_data.get("bear_prob", 50))   if agent_data else None
 agents_raw  = agent_data.get("agents", {})            if agent_data else {}
 debate_txt  = str(agent_data.get("debate", ""))       if agent_data else ""
-ag_verdict  = ("CALL" if str(agent_data.get("verdict","CALL")).upper()=="CALL" else "PUT") if agent_data else None
 consensus_t = float(agent_data.get("consensus_target", 0) or 0)            if agent_data else 0
-tl_raw      = str(agent_data.get("timeline","swing")).lower()               if agent_data else "swing"
-tl_reason   = str(agent_data.get("timeline_reason",""))                     if agent_data else ""
-tl_labels   = {"scalp":("SCALP","0–1 DAY","#ff9500"),"short":("SHORT","1–5 DAYS","#ffd700"),
-               "swing":("SWING","1–4 WEEKS","#00cfff"),"long":("LONG","1–3 MONTHS","#c084fc")}
-tl_key      = next((k for k in tl_labels if k in tl_raw), "swing")
-tl_name, tl_range, tl_color = tl_labels[tl_key]
+
+# Timeline: computed deterministically from data — not from LLM
+_ts_now  = _tech_score(md, tf)
+_tl_key, (_tl_name, _tl_range, _tl_color) = _compute_timeline(md, og, _ts_now)
+tl_name, tl_range, tl_color = _tl_name, _tl_range, _tl_color
 
 cur_atype  = _asset_type(ticker)
 bull_roles = _BULL_AGENT_ROLES.get(cur_atype, _BULL_AGENT_ROLES["stock"])
@@ -1227,11 +1383,15 @@ if agent_data:
     bear_targets = [float(agents_raw.get(a["id"],{}).get("price_target",0) or 0) for a in BEAR_AGENTS]
     bull_avg = round(sum(t for t in bull_targets if t>0)/max(1,sum(1 for t in bull_targets if t>0)),2)
     bear_avg = round(sum(t for t in bear_targets if t>0)/max(1,sum(1 for t in bear_targets if t>0)),2)
-    bot_call_score   = calls / len(results) * 50
-    agent_call_score = bull_prob / 100 * 50
-    combined_verdict = "CALL" if (bot_call_score + agent_call_score) >= 50 else "PUT"
+    # Weighted: 30% pure tech, 35% bots, 35% agents — tech score can override LLM bias
+    tech_call_pct    = (_ts_now + 5) / 10          # 0.0 (strongly bear) → 1.0 (strongly bull)
+    bot_call_pct     = calls / len(results)
+    agent_call_pct   = bull_prob / 100
+    combined_score   = tech_call_pct * 30 + bot_call_pct * 35 + agent_call_pct * 35
+    combined_verdict = "CALL" if combined_score >= 50 else "PUT"
     cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
-    combined_conf = round((avg_c * 0.4) + (max(bull_prob, bear_prob) * 0.6))
+    combined_conf = round((avg_c * 0.35) + (max(bull_prob, bear_prob) * 0.35) + (abs(_ts_now) / 5 * 100 * 0.30))
+    combined_conf = min(94, max(55, combined_conf))
 else:
     bull_avg = bear_avg = 0
     combined_verdict = final_bot
@@ -1297,7 +1457,11 @@ with tab_v:
         sig="COMBINED" if agent_data else ("STRONG" if avg_c>=80 else "MODERATE" if avg_c>=66 else "WEAK"),
         rev=rev_html,
         tlc=tl_color, tl_name=tl_name, tl_range=tl_range,
-        tl_reason_html='<div style="color:#556;font-size:10px;max-width:460px;margin:0 auto 10px;line-height:1.6">{}</div>'.format(tl_reason) if tl_reason else "",
+        tl_reason_html='<div style="color:#556;font-size:9px;max-width:460px;margin:0 auto 10px">Tech score: {}/5 — {}</div>'.format(
+            _ts_now,
+            "strongly bearish" if _ts_now<=-3 else "moderately bearish" if _ts_now<=-1 else
+            "neutral" if _ts_now==0 else "moderately bullish" if _ts_now<=2 else "strongly bullish"
+        ),
     ), unsafe_allow_html=True)
 
     # Price targets + prob bar (only if agents ran)
