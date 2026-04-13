@@ -593,7 +593,31 @@ def _compute_timeline(d, og, tech_score):
     return key, tl_map[key]
 
 
-def _build_prompt(sym, d, tf, bot_verdicts):
+def _compute_price_targets(px, md, og, tech_score):
+    """Compute bull/bear/consensus price targets from IV or 52w range — no LLM."""
+    if og and og.get("avg_iv", 0) > 0:
+        iv = og["avg_iv"] / 100.0
+        days = max(og.get("days_out", 30), 7)
+        expected_move = px * iv * math.sqrt(days / 365.0)
+    elif md:
+        h52 = md.get("high_52", px * 1.15)
+        l52 = md.get("low_52",  px * 0.85)
+        annual_range_pct = (h52 - l52) / px if px > 0 else 0.20
+        # Scale to 30-day expected move
+        expected_move = px * annual_range_pct * math.sqrt(30 / 252.0)
+    else:
+        expected_move = px * 0.05  # fallback: 5%
+
+    # Bias slightly in signal direction
+    bias = 1.0 + (tech_score / 5.0) * 0.15  # ±15% stretch at max signal strength
+    bull_move = expected_move * max(0.5, min(2.0, bias))
+    bear_move = expected_move * max(0.5, min(2.0, 2.0 - bias))
+
+    bull = round(px + bull_move, 2)
+    bear = round(max(0.01, px - bear_move), 2)
+    return bull, bear
+
+
     """Build LLM prompt — verdicts are PRE-COMPUTED; LLM writes analysis text only."""
     ab = lambda px, ref: "above" if ref and px > ref else "below" if ref else "N/A"
 
@@ -1016,21 +1040,20 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRA
         "• TYPHON: {typhon}\n"
         "• ERIS: {eris}\n\n"
         "YOUR ONLY JOB: Write the argument text for each agent. Be specific, cite data.\n"
-        "Probability, verdict, and timeline are computed separately from objective data — do NOT include them.\n"
-        "Each agent: 2 sentences max, specific to their domain, citing actual numbers where available.\n"
-        "price_target: realistic price level relative to ${px}. Do NOT default to current price.\n\n"
+        "Probability, verdict, timeline, and price targets are computed separately — do NOT include them.\n"
+        "Each agent: 2 sentences max, specific to their domain, citing actual numbers where available.\n\n"
         "Reply with ONLY this JSON (no markdown, no backticks):\n"
         '{{"agents":{{'
-        '"ZEUS":{{"argument":"...","price_target":0.0}},'
-        '"HERMES":{{"argument":"...","price_target":0.0}},'
-        '"APOLLO":{{"argument":"...","price_target":0.0}},'
-        '"ARES":{{"argument":"...","price_target":0.0}},'
-        '"POSEIDON":{{"argument":"...","price_target":0.0}},'
-        '"KRONOS":{{"argument":"...","price_target":0.0}},'
-        '"HADES":{{"argument":"...","price_target":0.0}},'
-        '"NEMESIS":{{"argument":"...","price_target":0.0}},'
-        '"TYPHON":{{"argument":"...","price_target":0.0}},'
-        '"ERIS":{{"argument":"...","price_target":0.0}}'
+        '"ZEUS":{{"argument":"..."}},'
+        '"HERMES":{{"argument":"..."}},'
+        '"APOLLO":{{"argument":"..."}},'
+        '"ARES":{{"argument":"..."}},'
+        '"POSEIDON":{{"argument":"..."}},'
+        '"KRONOS":{{"argument":"..."}},'
+        '"HADES":{{"argument":"..."}},'
+        '"NEMESIS":{{"argument":"..."}},'
+        '"TYPHON":{{"argument":"..."}},'
+        '"ERIS":{{"argument":"..."}}'
         '}},'
         '"debate":"2 sentences on which domain had the strongest case and why."}}'
     ).format(
@@ -1492,21 +1515,14 @@ bull_roles = _BULL_AGENT_ROLES.get(cur_atype, _BULL_AGENT_ROLES["stock"])
 bear_roles = _BEAR_AGENT_ROLES.get(cur_atype, _BEAR_AGENT_ROLES["stock"])
 
 if agent_data:
-    bull_targets = [float(agents_raw.get(a["id"],{}).get("price_target",0) or 0) for a in BULL_AGENTS]
-    bear_targets = [float(agents_raw.get(a["id"],{}).get("price_target",0) or 0) for a in BEAR_AGENTS]
-    bull_avg = round(sum(t for t in bull_targets if t>0)/max(1,sum(1 for t in bull_targets if t>0)),2)
-    bear_avg = round(sum(t for t in bear_targets if t>0)/max(1,sum(1 for t in bear_targets if t>0)),2)
-    # Consensus target = prob-weighted average of all 10 agent price targets
-    all_targets = [(t, True) for t in bull_targets] + [(t, False) for t in bear_targets]
-    w_bull = bull_prob / 100
-    w_bear = bear_prob / 100
-    w_sum = sum((w_bull if is_b else w_bear) for t, is_b in all_targets if t > 0)
-    consensus_t = round(
-        sum(t * (w_bull if is_b else w_bear) for t, is_b in all_targets if t > 0) / max(0.001, w_sum), 2
-    ) if w_sum > 0 else 0
+    pass  # agent text arguments still used below; price targets come from data
 else:
-    bull_avg = bear_avg = 0
-    consensus_t = 0
+    pass
+
+# Price targets computed deterministically from IV/52w-range — never from LLM
+_px_now = md["px"] if md else 0
+bull_avg, bear_avg = _compute_price_targets(_px_now, md, og, _ts_now) if _px_now > 0 else (0, 0)
+consensus_t = round(bull_avg * (bull_prob / 100) + bear_avg * (bear_prob / 100), 2) if _px_now > 0 else 0
 
 # Combined verdict = 55% tech + 45% bot consensus (fully objective, no LLM)
 tech_call_pct = (_ts_now + 5) / 10
@@ -1692,8 +1708,6 @@ with tab_a:
             bc  = ag_def["color"]
             sc  = "#00ff88" if side=="BULL" else "#ff4466"
             arg = str(a.get("argument","")).strip()
-            pt  = float(a.get("price_target", 0) or 0)
-            conf= min(94, max(55, int(a.get("confidence", 68))))
             return """
 <div style="background:linear-gradient(150deg,#0b0b1c,#0f0f26);border:1px solid {bc}40;
   border-radius:10px;padding:11px;margin-bottom:8px">
@@ -1706,14 +1720,10 @@ with tab_a:
     <div style="padding:1px 6px;border-radius:8px;background:{sc}12;border:1px solid {sc}33;
       color:{sc};font-size:8px;font-weight:800;flex-shrink:0">{side}</div>
   </div>
-  <div style="font-size:9px;line-height:1.6;color:#7788a0;margin-bottom:6px">{arg}</div>
-  <div style="display:flex;justify-content:space-between;font-size:8px">
-    <span style="color:{bc}">TARGET ${pt:.2f}</span>
-    <span style="color:#444">{conf}% conf</span>
-  </div>
+  <div style="font-size:9px;line-height:1.6;color:#7788a0">{arg}</div>
 </div>""".format(bc=bc, icon=ag_def["icon"], id=ag_def["id"], role=role_lbl,
                  sc=sc, side="▲ BULL" if side=="BULL" else "▼ BEAR",
-                 arg=arg, pt=pt, conf=conf)
+                 arg=arg)
 
         st.markdown('<div style="color:#ffd70077;font-size:9px;font-weight:800;letter-spacing:3px;margin-bottom:6px">▲ BULL — 5 AGENTS</div>', unsafe_allow_html=True)
         ba_cols = st.columns(5)
