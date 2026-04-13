@@ -708,10 +708,18 @@ def _extract_json(text):
         return None
 
 
+def _sf(v, default=55):
+    """Safe float conversion — returns default if v is None, empty, or non-numeric."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _parse_bot(bot_id, data, forced_verdict=None, forced_confidence=None):
     d          = data.get(bot_id, {})
     verdict    = forced_verdict or ("CALL" if "CALL" in str(d.get("verdict", "")).upper() else "PUT")
-    confidence = forced_confidence if forced_confidence is not None else min(93, max(55, int(d.get("confidence", 68))))
+    confidence = forced_confidence if forced_confidence is not None else min(93, max(55, int(_sf(d.get("confidence"), 68))))
     analysis   = str(d.get("analysis", "Analysis complete.")).strip()
     reversal   = None
     if bot_id == "DELTA":
@@ -734,7 +742,7 @@ def _parse_bot(bot_id, data, forced_verdict=None, forced_confidence=None):
                   ("Mid TF",       d.get("mid_tf",   55), 100),
                   ("Long TF",      d.get("long_tf",  55), 100)],
     }
-    metrics = [{"label": lbl, "value": min(mx, max(0, float(v or 55))), "max": mx}
+    metrics = [{"label": lbl, "value": min(mx, max(0, _sf(v))), "max": mx}
                for lbl, v, mx in metrics_map.get(bot_id, [])]
     return {"verdict": verdict, "confidence": confidence,
             "analysis": analysis, "metrics": metrics, "reversal": reversal}
