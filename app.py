@@ -618,6 +618,7 @@ def _compute_price_targets(px, md, og, tech_score):
     return bull, bear
 
 
+def _build_prompt(sym, d, tf, bot_verdicts):
     """Build LLM prompt — verdicts are PRE-COMPUTED; LLM writes analysis text only."""
     ab = lambda px, ref: "above" if ref and px > ref else "below" if ref else "N/A"
 
