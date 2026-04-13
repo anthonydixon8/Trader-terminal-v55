@@ -50,6 +50,45 @@ BOTS = [
      "tags": ["3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W", "1M"]},
 ]
 
+# ── Ticker normalization ───────────────────────────────────────────────────────
+# Maps common names → Yahoo Finance symbol (used for all data fetching)
+_YF_ALIASES = {
+    "GOLD":   "GC=F",   # Gold Futures
+    "SILVER": "SI=F",   # Silver Futures
+    "OIL":    "CL=F",   # Crude Oil Futures
+    "CRUDE":  "CL=F",
+    "NATGAS": "NG=F",   # Natural Gas
+    "GAS":    "NG=F",
+    "CORN":   "ZC=F",
+    "WHEAT":  "ZW=F",
+    "COPPER": "HG=F",
+    "BTC":    "BTC-USD",
+    "ETH":    "ETH-USD",
+    "SOL":    "SOL-USD",
+    "BITCOIN":"BTC-USD",
+    "ETHEREUM":"ETH-USD",
+}
+# Maps Yahoo Finance symbol → TradingView symbol (for chart widget)
+_TV_ALIASES = {
+    "GC=F":   "COMEX:GC1!",
+    "SI=F":   "COMEX:SI1!",
+    "CL=F":   "NYMEX:CL1!",
+    "NG=F":   "NYMEX:NG1!",
+    "ZC=F":   "CBOT:ZC1!",
+    "ZW=F":   "CBOT:ZW1!",
+    "HG=F":   "COMEX:HG1!",
+    "BTC-USD":"COINBASE:BTCUSD",
+    "ETH-USD":"COINBASE:ETHUSD",
+    "SOL-USD":"COINBASE:SOLUSD",
+}
+
+def _norm_ticker(sym):
+    """Return (yf_sym, display_sym, tv_sym) for a user-entered ticker."""
+    s = sym.strip().upper()
+    yf_sym = _YF_ALIASES.get(s, s)
+    tv_sym = _TV_ALIASES.get(yf_sym, yf_sym)
+    return yf_sym, s, tv_sym
+
 # ── Data fetching ──────────────────────────────────────────────────────────────
 _YF_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -725,12 +764,14 @@ _BULL_AGENT_ROLES = {
     "commodity": ["SUPPLY/DEMAND",   "MOMENTUM", "MACRO DRIVER","OPTIONS FLOW", "MACRO TAILWIND"],
     "etf":       ["FUND COMPOSITION","MOMENTUM", "MACRO EVENT", "OPTIONS FLOW", "SECTOR ROTATION"],
     "index":     ["MARKET BREADTH",  "MOMENTUM", "MACRO CATALYST","INDEX FLOW",  "GLOBAL MACRO"],
+    "crypto":    ["ON-CHAIN METRICS","MOMENTUM", "CATALYSTS",   "DERIVATIVES FLOW","MACRO/ADOPTION"],
 }
 _BEAR_AGENT_ROLES = {
     "stock":     ["VALUATION/RISK",  "TECH BREAKDOWN", "HEADWINDS",      "VOLATILITY",    "CONTRARIAN"],
     "commodity": ["OVERBOUGHT RISK", "TECH BREAKDOWN", "MACRO HEADWIND", "VOL/RISK",      "CONTRARIAN"],
     "etf":       ["OVEREXTENSION",   "TECH BREAKDOWN", "RISK-OFF",       "VOL/RISK",      "CONTRARIAN"],
     "index":     ["VALUATION RISK",  "TECH BREAKDOWN", "MACRO RISK",     "VOLATILITY",    "CONTRARIAN"],
+    "crypto":    ["OVEREXTENSION",   "TECH BREAKDOWN", "REGULATORY RISK","VOL/RISK",      "CONTRARIAN"],
 }
 BULL_AGENTS = [
     {"id": "ZEUS",     "color": "#ffd700", "icon": "⚡"},
@@ -769,14 +810,23 @@ _BROAD_ETFS = {
 }
 _INDEX_SYMS = {"SPX","NDX","RUT","DJI","VIX","COMP","NYA"}
 
+_COMMODITY_FUTURES = {
+    "GC=F","SI=F","CL=F","BZ=F","NG=F","HG=F",         # Metals + Energy
+    "ZC=F","ZW=F","ZS=F","ZL=F","ZM=F","CC=F","KC=F",  # Agriculture
+    "LE=F","GF=F","HE=F","PL=F","PA=F",                 # Livestock + PGMs
+}
+_CRYPTO_SYMS = {"BTC-USD","ETH-USD","SOL-USD","DOGE-USD","ADA-USD","XRP-USD","AVAX-USD","LTC-USD"}
+
 def _asset_type(sym):
     s = sym.upper().lstrip("^")
     if s in _INDEX_SYMS or sym.startswith("^"):
         return "index"
-    if s in _COMMODITY_ETFS:
+    if s in _COMMODITY_ETFS or s in _COMMODITY_FUTURES:
         return "commodity"
     if s in _BROAD_ETFS:
         return "etf"
+    if s in _CRYPTO_SYMS or s.endswith("-USD"):
+        return "crypto"
     return "stock"
 
 
@@ -1128,8 +1178,9 @@ with st.sidebar:
     if "pending_ticker" in st.session_state:
         st.session_state["ticker_inp"] = st.session_state.pop("pending_ticker")
     st.markdown('<div style="color:#334;font-size:9px;letter-spacing:1px;margin-bottom:4px">TICKER SYMBOL</div>', unsafe_allow_html=True)
-    ticker = st.text_input("Ticker", placeholder="AAPL  TSLA  SPY...",
+    _raw_ticker = st.text_input("Ticker", placeholder="AAPL  TSLA  SPY...",
                            label_visibility="collapsed", key="ticker_inp").strip().upper()
+    ticker, display_ticker, tv_ticker = _norm_ticker(_raw_ticker) if _raw_ticker else ("", _raw_ticker, _raw_ticker)
 
     _active_key = st.session_state["groq_key"] if st.session_state["provider"] == "groq" else st.session_state["ant_key"]
     run_btn = st.button("▶ ANALYZE", use_container_width=True,
@@ -1251,7 +1302,7 @@ if md:
         pos=pos52,
     ), unsafe_allow_html=True)
 else:
-    st.info("Live price data unavailable for {} — analysis will run using AI estimation.".format(ticker))
+    st.info("Live price data unavailable for {} — analysis will run using AI estimation.".format(display_ticker))
 
 # ── Options Greeks panel ──────────────────────────────────────────────────────
 if og:
@@ -1315,7 +1366,7 @@ tv_src = (
     "&symbol={sym}&interval=D&hidesidetoolbar=1&theme=dark&style=1"
     "&timezone=America%2FNew_York"
     "&studies=RSI%40tv-basicstudies%1FMACD%40tv-basicstudies&locale=en"
-).format(sym=ticker)
+).format(sym=tv_ticker)
 
 st.markdown("""
 <div style="background:#050510;border:1px solid #1c1c30;border-radius:12px;
@@ -1329,11 +1380,11 @@ st.markdown("""
   </div>
   <iframe src="{src}" width="100%" height="420" frameborder="0"
     allowfullscreen scrolling="no" title="chart-{sym}"></iframe>
-</div>""".format(sym=ticker, src=tv_src), unsafe_allow_html=True)
+</div>""".format(sym=display_ticker, src=tv_src), unsafe_allow_html=True)
 
 # ── Run analysis ───────────────────────────────────────────────────────────────
 if run_btn:
-    with st.spinner("Deploying 5-bot swarm on {}...".format(ticker)):
+    with st.spinner("Deploying 5-bot swarm on {}...".format(display_ticker)):
         try:
             results, raw = run_swarm(ticker, _active_key, st.session_state["provider"], md, tf)
             st.session_state["swarm_results"] = results
@@ -1346,7 +1397,7 @@ if run_btn:
             st.session_state["swarm_ticker"]  = ticker
             st.session_state.pop("swarm_results", None)
     if st.session_state.get("swarm_results"):
-        with st.spinner("⚡ Launching 8-agent debate on {}...".format(ticker)):
+        with st.spinner("⚡ Launching 8-agent debate on {}...".format(display_ticker)):
             try:
                 _ts = _tech_score(md, tf)
                 agent_data, agent_raw = run_agents(
