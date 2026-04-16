@@ -549,11 +549,21 @@ def _compute_bot_confidences(d, tf):
     return confs
 
 
-def _compute_agent_probs(tech_score, bot_calls, n_bots=5):
-    """Compute bull/bear probability from objective signals only. Zero LLM influence."""
+def _compute_agent_probs(tech_score, bot_calls, n_bots=5, bot_results=None):
+    """Compute bull/bear probability from objective signals only. Zero LLM influence.
+    Uses confidence-weighted bot vote when bot_results are available."""
     tech_pct = (tech_score + 5) / 10      # maps -5→0.0, 0→0.5, +5→1.0
-    bot_pct  = bot_calls / n_bots          # fraction of bots voting CALL
-    # 55% weight to tech score, 45% to bot vote
+
+    # Confidence-weighted bot vote: a 90% confident CALL matters more than a 60% CALL
+    if bot_results:
+        conf_calls = sum(r["confidence"] for r in bot_results if r["verdict"] == "CALL")
+        conf_puts  = sum(r["confidence"] for r in bot_results if r["verdict"] == "PUT")
+        total_conf = conf_calls + conf_puts
+        bot_pct = conf_calls / total_conf if total_conf > 0 else 0.5
+    else:
+        bot_pct = bot_calls / n_bots       # fallback: simple fraction
+
+    # 55% weight to tech score, 45% to confidence-weighted bot vote
     bull_raw = tech_pct * 0.55 + bot_pct * 0.45
     bull_prob = max(10, min(90, round(bull_raw * 100)))
     return bull_prob, 100 - bull_prob
@@ -619,81 +629,101 @@ def _compute_price_targets(px, md, og, tech_score):
 
 
 def _build_prompt(sym, d, tf, bot_verdicts):
-    """Build LLM prompt — verdicts are PRE-COMPUTED; LLM writes analysis text only."""
+    """Build LLM prompt — verdicts are PRE-COMPUTED; LLM writes domain-specific analysis only."""
     ab = lambda px, ref: "above" if ref and px > ref else "below" if ref else "N/A"
+    vd = bot_verdicts
 
+    # ── Per-bot data snippets (each bot sees ONLY its own indicators) ──────────
     if d:
-        sma50_txt  = "${:.2f}".format(d["sma50"])  if d["sma50"]  else "N/A"
-        sma200_txt = "${:.2f}".format(d["sma200"]) if d["sma200"] else "N/A"
-        pcr_txt    = str(d["pcr"]) if d["pcr"] is not None else "unavailable"
-        pos52 = ((d["px"] - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
-        data_block = (
-            "LIVE MARKET DATA FOR {sym}:\n"
-            "  Price: ${px} ({sign}{chg}%)  52wH/L: ${h52}/${l52}  52w-pos: {pos:.0f}%\n"
-            "  Volume: {vol:,} ({vr:.1f}x avg)\n\n"
-            "ARIA  — RSI-14: {rsi}  %B: {pctB:.3f}  Vol: {vr:.1f}x\n"
-            "NEXUS — SMA7: ${sma7} ({rel7})  SMA20: ${sma20} ({rel20})"
-            "  SMA50: {sma50} ({rel50})  SMA200: {sma200} ({rel200})\n"
-            "        EMA12: ${ema12}  EMA26: ${ema26} ({ecross})  VWAP: ${vwap} ({relvwap})\n"
-            "SIGMA — Put/Call Ratio: {pcr}  52w pos: {pos:.0f}%\n"
-            "DELTA — MACD hist: {mh} ({mdir})  RSI-div: {rdiv}\n"
-        ).format(
-            sym=sym, px=d["px"], sign="+" if d["chg"] >= 0 else "", chg=d["chg"],
-            h52=d["high_52"], l52=d["low_52"], vol=d["volume"], vr=d["vol_ratio"],
-            pos=pos52, rsi=d["rsi"], pctB=d["pctB"],
-            sma7=d["sma7"],   rel7=ab(d["px"], d["sma7"]),
-            sma20=d["sma20"], rel20=ab(d["px"], d["sma20"]),
-            sma50=sma50_txt,  rel50=ab(d["px"], d["sma50"]),
-            sma200=sma200_txt,rel200=ab(d["px"], d["sma200"]),
-            ema12=d["ema12"], ema26=d["ema26"],
-            ecross="bullish" if d["ema12"] > d["ema26"] else "bearish",
-            vwap=d["vwap"],   relvwap=ab(d["px"], d["vwap"]),
-            pcr=pcr_txt, mh=d["macd_hist"],
-            mdir="expanding" if abs(d["macd_hist"]) > abs(d["macd_hist_prev"]) else "contracting",
-            rdiv=d["rsi_div"],
-        )
-    else:
-        data_block = "Live data unavailable. Use your knowledge of {} to estimate.\n".format(sym)
+        px = d["px"]
+        pos52 = ((px - d["low_52"]) / (d["high_52"] - d["low_52"]) * 100) if d["high_52"] != d["low_52"] else 50
 
-    tf_block = "ATLAS — MULTI-TIMEFRAME:\n  "
+        aria_data = "RSI-14={rsi}  Bollinger-%B={pctB:.3f}  Volume={vr:.1f}x-avg".format(
+            rsi=d["rsi"], pctB=d["pctB"], vr=d["vol_ratio"])
+
+        s50  = "${:.2f}".format(d["sma50"])  if d["sma50"]  else "N/A"
+        s200 = "${:.2f}".format(d["sma200"]) if d["sma200"] else "N/A"
+        nexus_data = (
+            "Price=${px}  SMA7=${s7}({r7})  SMA20=${s20}({r20})  SMA50={s50}({r50})  "
+            "SMA200={s200}({r200})  EMA12=${e12} vs EMA26=${e26}({ecr})  VWAP=${vwap}({rvwap})"
+        ).format(
+            px=px, s7=d["sma7"], r7=ab(px,d["sma7"]),
+            s20=d["sma20"], r20=ab(px,d["sma20"]),
+            s50=s50, r50=ab(px,d["sma50"]),
+            s200=s200, r200=ab(px,d["sma200"]),
+            e12=d["ema12"], e26=d["ema26"],
+            ecr="bullish-cross" if d["ema12"]>d["ema26"] else "bearish-cross",
+            vwap=d["vwap"], rvwap=ab(px,d["vwap"]))
+
+        pcr_txt = str(d["pcr"]) if d["pcr"] is not None else "unavailable"
+        sigma_data = "Put/Call-Ratio={pcr}  52w-position={pos:.0f}%  (0%=52w-low, 100%=52w-high)".format(
+            pcr=pcr_txt, pos=pos52)
+
+        mdir = "expanding" if abs(d["macd_hist"]) > abs(d["macd_hist_prev"]) else "contracting"
+        delta_data = "MACD-histogram={mh}({mdir})  prev={mp}  RSI-divergence={rdiv}".format(
+            mh=d["macd_hist"], mdir=mdir, mp=d["macd_hist_prev"], rdiv=d["rsi_div"])
+    else:
+        aria_data = nexus_data = sigma_data = delta_data = "No live data."
+
     if tf:
         bull_tf = sum(1 for v in tf.values() if v == "BULL")
         bear_tf = sum(1 for v in tf.values() if v == "BEAR")
-        tf_block += "  ".join("{}: {}".format(k, v) for k, v in tf.items())
-        tf_block += "  ({} BULL / {} BEAR)\n".format(bull_tf, bear_tf)
+        atlas_data = "  ".join("{}: {}".format(k, v) for k, v in tf.items())
+        atlas_data += "  → {} BULL / {} BEAR".format(bull_tf, bear_tf)
+        bull_count = bull_tf
     else:
-        tf_block += "Unavailable.\n"
+        atlas_data = "Unavailable."
+        bull_count = 4
 
-    vd = bot_verdicts
     return (
-        "Write analysis text for 5 trading bots analyzing {sym}.\n\n"
-        "IMPORTANT: The verdicts below are FINAL and computed from hard indicator thresholds.\n"
-        "DO NOT change any verdict. Your ONLY job is to write 2 sentences explaining WHY\n"
-        "each bot reached its verdict, citing the specific numbers from the data below.\n\n"
-        "FIXED VERDICTS:\n"
-        "  ARIA={aria}  NEXUS={nexus}  SIGMA={sigma}  DELTA={delta}  ATLAS={atlas}\n\n"
-        "{data}\n{tf}\n"
+        "Five specialized trading bots analyzed {sym}. Their verdicts are FINAL (computed from "
+        "hard Python thresholds). Write EXACTLY 2 sentences of analysis for each bot, citing ONLY "
+        "the specific numbers shown for that bot. Do NOT reference another bot's indicators.\n\n"
+
+        "ARIA — MOMENTUM SCANNER — verdict: {aria}\n"
+        "  Data: {aria_data}\n"
+        "  Write 2 sentences about RSI, Bollinger %B, and volume that explain why verdict is {aria}.\n"
+        "  Do NOT mention SMAs, MACD, or timeframes.\n\n"
+
+        "NEXUS — TREND ANALYST — verdict: {nexus}\n"
+        "  Data: {nexus_data}\n"
+        "  Write 2 sentences about SMA/EMA alignment and VWAP that explain why verdict is {nexus}.\n"
+        "  Do NOT mention RSI, Bollinger, or MACD.\n\n"
+
+        "SIGMA — SENTIMENT READER — verdict: {sigma}\n"
+        "  Data: {sigma_data}\n"
+        "  Write 2 sentences about the put/call ratio and 52-week positioning that explain why verdict is {sigma}.\n"
+        "  Do NOT mention price action, RSI, or moving averages.\n\n"
+
+        "DELTA — DIVERGENCE HUNTER — verdict: {delta}\n"
+        "  Data: {delta_data}\n"
+        "  Write 2 sentences about MACD histogram direction/expansion and RSI divergence that explain why verdict is {delta}.\n"
+        "  Do NOT mention SMAs, volume, or 52-week range.\n\n"
+
+        "ATLAS — MULTI-TIMEFRAME ANALYST — verdict: {atlas}\n"
+        "  Data: {atlas_data}\n"
+        "  Write 2 sentences about the timeframe breakdown ({bull_count} BULL / {bear_count} BEAR) "
+        "and what the dominant bias means for verdict {atlas}.\n"
+        "  Do NOT mention RSI, MACD, or SMAs.\n\n"
+
         "Reply with ONLY this JSON (no markdown):\n"
         '{{"ARIA":{{"verdict":"{aria}","confidence":72,'
-        '"analysis":"2 sentences about {sym} RSI/Bollinger/volume explaining the {aria} verdict.",'
-        '"rsi":55,"vol":80,"mom":60}},'
+        '"analysis":"...","rsi":55,"vol":80,"mom":60}},'
         '"NEXUS":{{"verdict":"{nexus}","confidence":70,'
-        '"analysis":"2 sentences about {sym} SMA/EMA/VWAP alignment explaining the {nexus} verdict.",'
-        '"sma7":55,"ema":60,"trend":58}},'
+        '"analysis":"...","sma7":55,"ema":60,"trend":58}},'
         '"SIGMA":{{"verdict":"{sigma}","confidence":68,'
-        '"analysis":"2 sentences about {sym} options sentiment/PCR explaining the {sigma} verdict.",'
-        '"pcr":55,"ivr":50,"flow":52}},'
+        '"analysis":"...","pcr":55,"ivr":50,"flow":52}},'
         '"DELTA":{{"verdict":"{delta}","confidence":74,"rev":"NONE",'
-        '"analysis":"2 sentences about {sym} MACD/divergence explaining the {delta} verdict.",'
-        '"macd":60,"rsid":55,"cvd":58}},'
+        '"analysis":"...","macd":60,"rsid":55,"cvd":58}},'
         '"ATLAS":{{"verdict":"{atlas}","confidence":71,'
-        '"analysis":"2 sentences about {sym} multi-timeframe bias explaining the {atlas} verdict.",'
-        '"short_tf":55,"mid_tf":60,"long_tf":58,"bull_count":{bull_count}}}}}'
+        '"analysis":"...","short_tf":55,"mid_tf":60,"long_tf":58,"bull_count":{bull_count}}}}}'
     ).format(
-        sym=sym, data=data_block, tf=tf_block,
-        aria=vd["ARIA"], nexus=vd["NEXUS"], sigma=vd["SIGMA"],
+        sym=sym,
+        aria=vd["ARIA"],  nexus=vd["NEXUS"], sigma=vd["SIGMA"],
         delta=vd["DELTA"], atlas=vd["ATLAS"],
-        bull_count=(sum(1 for v in tf.values() if v == "BULL") if tf else 4),
+        aria_data=aria_data, nexus_data=nexus_data,
+        sigma_data=sigma_data, delta_data=delta_data, atlas_data=atlas_data,
+        bull_count=bull_count, bear_count=(9 - bull_count),
     )
 
 
@@ -1037,21 +1067,23 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRA
         "OPTIONS & GREEKS DATA:\n{greeks}\n\n"
         "CRITICAL: {sym} is a {asset_label}. Arguments must be appropriate to this asset class.\n"
         "{no_earnings_note}\n\n"
-        "BULL agents (argue for CALL / price UP):\n"
-        "• ZEUS: {zeus}\n"
-        "• HERMES: {hermes}\n"
-        "• APOLLO: {apollo}\n"
-        "• ARES: {ares}\n"
-        "• POSEIDON: {poseidon}\n\n"
-        "BEAR agents (argue for PUT / price DOWN — 5 agents for balance):\n"
-        "• KRONOS: {kronos}\n"
-        "• HADES: {hades}\n"
-        "• NEMESIS: {nemesis}\n"
-        "• TYPHON: {typhon}\n"
-        "• ERIS: {eris}\n\n"
-        "YOUR ONLY JOB: Write the argument text for each agent. Be specific, cite data.\n"
-        "Probability, verdict, timeline, and price targets are computed separately — do NOT include them.\n"
-        "Each agent: 2 sentences max, specific to their domain, citing actual numbers where available.\n\n"
+        "BULL agents — each argues ONLY from their assigned domain (2 sentences, cite numbers):\n"
+        "• ZEUS covers: {zeus}\n"
+        "• HERMES covers: {hermes}\n"
+        "• APOLLO covers: {apollo}\n"
+        "• ARES covers: {ares}\n"
+        "• POSEIDON covers: {poseidon}\n\n"
+        "BEAR agents — each argues ONLY from their assigned domain (2 sentences, cite numbers):\n"
+        "• KRONOS covers: {kronos}\n"
+        "• HADES covers: {hades}\n"
+        "• NEMESIS covers: {nemesis}\n"
+        "• TYPHON covers: {typhon}\n"
+        "• ERIS covers: {eris}\n\n"
+        "RULES — strictly enforced:\n"
+        "1. Each agent writes ONLY about their assigned domain. No straying into another agent's territory.\n"
+        "2. Cite the specific numbers from the data above. No generic statements.\n"
+        "3. Verdict, probability, and price targets are pre-computed — do NOT include them.\n"
+        "4. 2 sentences maximum per agent.\n\n"
         "Reply with ONLY this JSON (no markdown, no backticks):\n"
         '{{"agents":{{'
         '"ZEUS":{{"argument":"..."}},'
@@ -1065,7 +1097,7 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRA
         '"TYPHON":{{"argument":"..."}},'
         '"ERIS":{{"argument":"..."}}'
         '}},'
-        '"debate":"2 sentences explaining why the {verdict_side} case was stronger — cite the most compelling agent arguments."}}'
+        '"debate":"Strongest {verdict_side} argument: [1 sentence]. Strongest opposing concern: [1 sentence]."}}'
     ).format(
         sym=sym, asset_label=asset_label,
         data=data_s, tf=tf_s, bots=bot_summary, px=px,
@@ -1095,7 +1127,7 @@ def run_agents(sym, api_key, provider, market_data, tf_data, bot_results, greeks
     )
     # Pre-compute combined verdict here so LLM debate is locked to the right outcome
     bot_calls = sum(1 for r in bot_results if r["verdict"] == "CALL")
-    _bull_p, _bear_p = _compute_agent_probs(tech_score, bot_calls, len(bot_results))
+    _bull_p, _bear_p = _compute_agent_probs(tech_score, bot_calls, len(bot_results), bot_results=bot_results)
     _cv = "CALL" if _bull_p >= 50 else "PUT"
     prompt = _build_agent_prompt(sym, market_data, tf_data, bot_results, greeks,
                                  tech_bias_label=ts_label,
@@ -1523,7 +1555,7 @@ debate_txt = str(agent_data.get("debate", "")) if agent_data else ""
 
 # All numerical outputs computed from objective data — zero LLM influence
 _ts_now = _tech_score(md, tf)
-bull_prob, bear_prob = _compute_agent_probs(_ts_now, calls, len(results))
+bull_prob, bear_prob = _compute_agent_probs(_ts_now, calls, len(results), bot_results=results)
 
 # Timeline: deterministic from data
 _tl_key, (_tl_name, _tl_range, _tl_color) = _compute_timeline(md, og, _ts_now)
