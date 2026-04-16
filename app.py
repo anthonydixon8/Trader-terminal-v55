@@ -931,7 +931,7 @@ def _agent_roles(sym, atype):
         }
 
 
-def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRAL (0/5)"):
+def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRAL (0/5)", combined_verdict="CALL", bull_prob=50):
     atype = _asset_type(sym)
     asset_label = {"commodity": "commodity/metal ETF", "etf": "broad ETF/fund",
                    "index": "market index", "stock": "individual stock"}.get(atype, "asset")
@@ -1028,8 +1028,9 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRA
     return (
         "{sym} is a {asset_label}. 10 AI agents debate CALL (price UP) vs PUT (price DOWN).\n\n"
         "OBJECTIVE TECHNICAL ASSESSMENT: {tech_bias}\n"
-        "The debate outcome MUST be consistent with this technical reality.\n"
-        "Bears should win if the score is negative. Bulls if positive. Do NOT override this with bias.\n\n"
+        "PRE-COMPUTED VERDICT (from Python indicators — NOT negotiable): {verdict} ({bull_prob}% bull)\n"
+        "The debate text MUST conclude that the {verdict_side} side made the stronger case.\n"
+        "Do NOT contradict or override this verdict in any part of your response.\n\n"
         "MARKET DATA:\n{data}\n"
         "Timeframes: {tf}\n"
         "Technical bots (Python-computed, unbiased): {bots}\n\n"
@@ -1064,11 +1065,14 @@ def _build_agent_prompt(sym, d, tf, bot_results, greeks, tech_bias_label="NEUTRA
         '"TYPHON":{{"argument":"..."}},'
         '"ERIS":{{"argument":"..."}}'
         '}},'
-        '"debate":"2 sentences on which domain had the strongest case and why."}}'
+        '"debate":"2 sentences explaining why the {verdict_side} case was stronger — cite the most compelling agent arguments."}}'
     ).format(
         sym=sym, asset_label=asset_label,
         data=data_s, tf=tf_s, bots=bot_summary, px=px,
         greeks=greeks_s, tech_bias=tech_bias_label,
+        verdict=combined_verdict,
+        bull_prob=bull_prob,
+        verdict_side="BULL/CALL" if combined_verdict == "CALL" else "BEAR/PUT",
         no_earnings_note=(
             "DO NOT mention company earnings, revenue, or P/E ratios — {sym} is NOT a company stock.".format(sym=sym)
             if atype in ("commodity", "etf", "index") else
@@ -1089,8 +1093,14 @@ def run_agents(sym, api_key, provider, market_data, tf_data, bot_results, greeks
         "MODERATELY BULLISH ({}/5) — bulls have a slight edge".format(tech_score)           if tech_score <= 2  else
         "STRONGLY BULLISH ({}/5) — bull agents have a significant edge".format(tech_score)
     )
+    # Pre-compute combined verdict here so LLM debate is locked to the right outcome
+    bot_calls = sum(1 for r in bot_results if r["verdict"] == "CALL")
+    _bull_p, _bear_p = _compute_agent_probs(tech_score, bot_calls, len(bot_results))
+    _cv = "CALL" if _bull_p >= 50 else "PUT"
     prompt = _build_agent_prompt(sym, market_data, tf_data, bot_results, greeks,
-                                 tech_bias_label=ts_label)
+                                 tech_bias_label=ts_label,
+                                 combined_verdict=_cv,
+                                 bull_prob=_bull_p)
     system = "You are a multi-agent financial debate API. Output ONLY raw JSON. No markdown, no explanation, no backticks."
 
     if provider == "groq":
@@ -1595,9 +1605,9 @@ with tab_v:
   </div>
   {tl_reason_html}
 </div>""".format(
-        cvc=cvc, ticker=ticker, bc=calls, cv=combined_verdict, conf=combined_conf,
+        cvc=cvc, ticker=display_ticker, bc=calls, cv=combined_verdict, conf=combined_conf,
         label="COMBINED VERDICT — BOTS + AGENTS" if agent_data else "5-BOT CONSENSUS",
-        prob_line="Agents {}% BULL · 50/50 weight".format(bull_prob) if agent_data else "{}/5 CALL".format(calls),
+        prob_line="{}% BULL signal · 55% tech / 45% bots".format(bull_prob) if agent_data else "{}/5 CALL".format(calls),
         sig="COMBINED" if agent_data else ("STRONG" if avg_c>=80 else "MODERATE" if avg_c>=66 else "WEAK"),
         rev=rev_html,
         tlc=tl_color, tl_name=tl_name, tl_range=tl_range,
