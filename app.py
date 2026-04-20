@@ -607,16 +607,17 @@ def _compute_price_targets(px, md, og, tech_score):
     """Compute bull/bear/consensus price targets from IV or 52w range — no LLM."""
     if og and og.get("avg_iv", 0) > 0:
         iv = og["avg_iv"] / 100.0
-        days = max(og.get("days_out", 30), 7)
+        # Cap DTE at 45 days max to prevent exploding targets on long-dated options
+        days = max(7, min(45, og.get("days_out", 30)))
         expected_move = px * iv * math.sqrt(days / 365.0)
     elif md:
         h52 = md.get("high_52", px * 1.15)
         l52 = md.get("low_52",  px * 0.85)
-        annual_range_pct = (h52 - l52) / px if px > 0 else 0.20
-        # Scale to 30-day expected move
+        # Cap annual range at 100% to prevent extreme moves for high-vol stocks
+        annual_range_pct = min(1.0, (h52 - l52) / px) if px > 0 else 0.20
         expected_move = px * annual_range_pct * math.sqrt(30 / 252.0)
     else:
-        expected_move = px * 0.05  # fallback: 5%
+        expected_move = px * 0.05
 
     # Bias slightly in signal direction
     bias = 1.0 + (tech_score / 5.0) * 0.15  # ±15% stretch at max signal strength
@@ -625,6 +626,10 @@ def _compute_price_targets(px, md, og, tech_score):
 
     bull = round(px + bull_move, 2)
     bear = round(max(0.01, px - bear_move), 2)
+
+    # Sanity caps: targets cannot exceed ±55% from current price
+    bull = min(bull, round(px * 1.55, 2))
+    bear = max(bear, round(px * 0.45, 2))
     return bull, bear
 
 
@@ -1333,6 +1338,17 @@ if not ticker:
 md = fetch_market_data(ticker)
 tf = fetch_tf_data(ticker)
 og = fetch_options_greeks(ticker)
+
+# Use regularMarketPrice from options API as live price when available —
+# it is more real-time than the OHLCV close from the chart endpoint
+if md and og and og.get("spot", 0) > 0:
+    _spot = og["spot"]
+    _close = md["px"]
+    # Only override if within 10% to guard against data source mismatch
+    if abs(_spot - _close) / max(_close, 0.01) < 0.10:
+        md = dict(md)
+        md["px"] = _spot  # chg stays as daily % vs yesterday's close — still accurate
+
 if md:
     up = md["chg"] >= 0
     cc = "#00ff88" if up else "#ff4466"
@@ -1575,14 +1591,11 @@ _px_now = md["px"] if md else 0
 bull_avg, bear_avg = _compute_price_targets(_px_now, md, og, _ts_now) if _px_now > 0 else (0, 0)
 consensus_t = round(bull_avg * (bull_prob / 100) + bear_avg * (bear_prob / 100), 2) if _px_now > 0 else 0
 
-# Combined verdict = 55% tech + 45% bot consensus (fully objective, no LLM)
-tech_call_pct = (_ts_now + 5) / 10
-bot_call_pct  = calls / len(results)
-combined_score = tech_call_pct * 55 + bot_call_pct * 45
-combined_verdict = "CALL" if combined_score >= 50 else "PUT"
+# Combined verdict driven by bull_prob (confidence-weighted bots + tech score)
+# This keeps combined_verdict, probability bar, and confidence all consistent
+combined_verdict = "CALL" if bull_prob >= 50 else "PUT"
 cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
-# Confidence = how far from 50 the score is (stronger signal = higher conf)
-combined_conf = min(93, max(55, 55 + int(abs(combined_score - 50) * 0.76)))
+combined_conf = min(93, max(55, 55 + int(abs(bull_prob - 50) * 0.76)))
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab_v, tab_b, tab_a = st.tabs(["⚡  VERDICT", "🤖  BOTS", "⚔  AGENTS"])
