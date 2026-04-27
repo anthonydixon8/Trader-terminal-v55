@@ -551,17 +551,23 @@ def _compute_bot_confidences(d, tf):
 
 def _compute_agent_probs(tech_score, bot_calls, n_bots=5, bot_results=None):
     """Compute bull/bear probability from objective signals only. Zero LLM influence.
-    Uses confidence-weighted bot vote when bot_results are available."""
+    ATLAS counts as 2x weight — it synthesizes 9 timeframes vs single indicators."""
     tech_pct = (tech_score + 5) / 10      # maps -5→0.0, 0→0.5, +5→1.0
 
-    # Confidence-weighted bot vote: a 90% confident CALL matters more than a 60% CALL
     if bot_results:
-        conf_calls = sum(r["confidence"] for r in bot_results if r["verdict"] == "CALL")
-        conf_puts  = sum(r["confidence"] for r in bot_results if r["verdict"] == "PUT")
+        conf_calls = 0.0
+        conf_puts  = 0.0
+        for r in bot_results:
+            # ATLAS covers 9 timeframes — give it 2x weight vs single-indicator bots
+            w = 2.0 if r.get("id") == "ATLAS" else 1.0
+            if r["verdict"] == "CALL":
+                conf_calls += r["confidence"] * w
+            else:
+                conf_puts  += r["confidence"] * w
         total_conf = conf_calls + conf_puts
         bot_pct = conf_calls / total_conf if total_conf > 0 else 0.5
     else:
-        bot_pct = bot_calls / n_bots       # fallback: simple fraction
+        bot_pct = bot_calls / n_bots
 
     # 55% weight to tech score, 45% to confidence-weighted bot vote
     bull_raw = tech_pct * 0.55 + bot_pct * 0.45
@@ -779,7 +785,7 @@ def _parse_bot(bot_id, data, forced_verdict=None, forced_confidence=None):
     }
     metrics = [{"label": lbl, "value": min(mx, max(0, _sf(v))), "max": mx}
                for lbl, v, mx in metrics_map.get(bot_id, [])]
-    return {"verdict": verdict, "confidence": confidence,
+    return {"id": bot_id, "verdict": verdict, "confidence": confidence,
             "analysis": analysis, "metrics": metrics, "reversal": reversal}
 
 
@@ -1591,6 +1597,20 @@ _px_now = md["px"] if md else 0
 bull_avg, bear_avg = _compute_price_targets(_px_now, md, og, _ts_now) if _px_now > 0 else (0, 0)
 consensus_t = round(bull_avg * (bull_prob / 100) + bear_avg * (bear_prob / 100), 2) if _px_now > 0 else 0
 
+# Detect TF conflict: ATLAS disagrees AND bear TFs are a majority of directional TFs
+_atlas_result = next((r for r in results if r["id"] == "ATLAS"), None)
+_atlas_verdict = _atlas_result["verdict"] if _atlas_result else None
+_tf_conflict = False
+if tf and _atlas_verdict:
+    _bear_tf = sum(1 for v in tf.values() if v == "BEAR")
+    _bull_tf = sum(1 for v in tf.values() if v == "BULL")
+    _directional = _bear_tf + _bull_tf
+    # Conflict: ATLAS voted PUT AND bears outnumber bulls in directional TFs
+    if _atlas_verdict == "PUT" and _directional > 0 and _bear_tf > _bull_tf:
+        _tf_conflict = True
+    elif _atlas_verdict == "CALL" and _directional > 0 and _bull_tf > _bear_tf:
+        _tf_conflict = False  # Atlas aligns — no conflict
+
 # Combined verdict driven by bull_prob (confidence-weighted bots + tech score)
 # This keeps combined_verdict, probability bar, and confidence all consistent
 combined_verdict = "CALL" if bull_prob >= 50 else "PUT"
@@ -1656,10 +1676,21 @@ with tab_v:
         sig="COMBINED" if agent_data else ("STRONG" if avg_c>=80 else "MODERATE" if avg_c>=66 else "WEAK"),
         rev=rev_html,
         tlc=tl_color, tl_name=tl_name, tl_range=tl_range,
-        tl_reason_html='<div style="color:#556;font-size:9px;max-width:460px;margin:0 auto 10px">Tech score: {}/5 — {}</div>'.format(
-            _ts_now,
-            "strongly bearish" if _ts_now<=-3 else "moderately bearish" if _ts_now<=-1 else
-            "neutral" if _ts_now==0 else "moderately bullish" if _ts_now<=2 else "strongly bullish"
+        tl_reason_html=(
+            '<div style="color:#556;font-size:9px;max-width:460px;margin:0 auto 6px">'
+            'Tech score: {ts}/5 — {ts_lbl}</div>'
+            '{conflict_html}'
+        ).format(
+            ts=_ts_now,
+            ts_lbl=("strongly bearish" if _ts_now<=-3 else "moderately bearish" if _ts_now<=-1 else
+                    "neutral" if _ts_now==0 else "moderately bullish" if _ts_now<=2 else "strongly bullish"),
+            conflict_html=(
+                '<div style="margin:4px auto 6px;max-width:460px;padding:5px 10px;'
+                'background:#ff950014;border:1px solid #ff950044;border-radius:6px;'
+                'color:#ff9500;font-size:9px;font-weight:700;text-align:center">'
+                '⚠ MULTI-TIMEFRAME CONFLICT — ATLAS shows {bear}+ bearish TFs vs {bull} bullish. '
+                'Short-term momentum diverges from this verdict. Exercise caution.</div>'
+            ).format(bear=_bear_tf, bull=_bull_tf) if _tf_conflict else ''
         ),
     ), unsafe_allow_html=True)
 
