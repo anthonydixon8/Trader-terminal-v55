@@ -1597,25 +1597,24 @@ _px_now = md["px"] if md else 0
 bull_avg, bear_avg = _compute_price_targets(_px_now, md, og, _ts_now) if _px_now > 0 else (0, 0)
 consensus_t = round(bull_avg * (bull_prob / 100) + bear_avg * (bear_prob / 100), 2) if _px_now > 0 else 0
 
-# Detect TF conflict: ATLAS disagrees AND bear TFs are a majority of directional TFs
-_atlas_result = next((r for r in results if r["id"] == "ATLAS"), None)
+# Detect TF conflict: ATLAS verdict disagrees with combined verdict
+_atlas_result  = next((r for r in results if r["id"] == "ATLAS"), None)
 _atlas_verdict = _atlas_result["verdict"] if _atlas_result else None
-_tf_conflict = False
+_tf_conflict   = False
+_bear_tf = _bull_tf = 0
 if tf and _atlas_verdict:
     _bear_tf = sum(1 for v in tf.values() if v == "BEAR")
     _bull_tf = sum(1 for v in tf.values() if v == "BULL")
-    _directional = _bear_tf + _bull_tf
-    # Conflict: ATLAS voted PUT AND bears outnumber bulls in directional TFs
-    if _atlas_verdict == "PUT" and _directional > 0 and _bear_tf > _bull_tf:
-        _tf_conflict = True
-    elif _atlas_verdict == "CALL" and _directional > 0 and _bull_tf > _bear_tf:
-        _tf_conflict = False  # Atlas aligns — no conflict
 
 # Combined verdict driven by bull_prob (confidence-weighted bots + tech score)
 # This keeps combined_verdict, probability bar, and confidence all consistent
 combined_verdict = "CALL" if bull_prob >= 50 else "PUT"
 cvc = "#00ff88" if combined_verdict == "CALL" else "#ff4466"
 combined_conf = min(93, max(55, 55 + int(abs(bull_prob - 50) * 0.76)))
+
+# Bidirectional TF conflict: fire whenever ATLAS verdict != combined verdict
+if _atlas_verdict:
+    _tf_conflict = _atlas_verdict != combined_verdict
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab_v, tab_b, tab_a = st.tabs(["⚡  VERDICT", "🤖  BOTS", "⚔  AGENTS"])
@@ -1688,9 +1687,14 @@ with tab_v:
                 '<div style="margin:4px auto 6px;max-width:460px;padding:5px 10px;'
                 'background:#ff950014;border:1px solid #ff950044;border-radius:6px;'
                 'color:#ff9500;font-size:9px;font-weight:700;text-align:center">'
-                '⚠ MULTI-TIMEFRAME CONFLICT — ATLAS shows {bear}+ bearish TFs vs {bull} bullish. '
-                'Short-term momentum diverges from this verdict. Exercise caution.</div>'
-            ).format(bear=_bear_tf, bull=_bull_tf) if _tf_conflict else ''
+                + (
+                    '⚠ TF CONFLICT — ATLAS shows {bear} bearish TFs ({bull} bullish). '
+                    'Short-term momentum leans PUT. Exercise caution on CALL entry timing.'.format(bear=_bear_tf, bull=_bull_tf)
+                    if _atlas_verdict == "PUT" else
+                    '⚠ TF CONFLICT — ATLAS shows {bull} bullish TFs ({bear} bearish). '
+                    'Short-term momentum leans CALL. Intraday bounce possible but daily trend remains bearish.'.format(bull=_bull_tf, bear=_bear_tf)
+                ) + '</div>'
+            ) if _tf_conflict else ''
         ),
     ), unsafe_allow_html=True)
 
